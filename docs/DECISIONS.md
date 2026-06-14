@@ -122,3 +122,11 @@ This is the lightweight decision log for Rux. Add entries when a choice would ot
 - Reason: Local `.claude` and `.codex` session analysis showed that the largest waste pattern is repeated context and oversized tool output, not verbose final answers. A reminder in every repo will not hold over time; agents need one policy source to read before choosing routes, effort, subagents, and output volume.
 - Consequence: Global Claude/Codex instructions and project `AGENTS.md` files should point at Rux policy instead of duplicating thresholds. `rux policy`, `rux status`, and `rux plan` expose the policy. `rux run` caps visible provider output while retaining full transcripts. The current mode is still advisory until Rux grows live-session interruption and broader command-output brokering.
 - Revisit when: Rux can observe live session usage, broker tool output, or automatically start handoff/resume flows.
+
+## RUX-016: Observed Model Metadata Comes From Provider Usage Maps
+
+- Date: 2026-06-14
+- Decision: The adapter reads the observed model from the provider's usage map (the key inside Claude `modelUsage` / Gemini `stats.models`), not from a top-level `model` field, and Codex stays honestly `not_observed` because `codex exec --json` reports no model.
+- Reason: Wave 2 shipped structured-output parsing but keyed on a `model` field the installed CLIs do not emit — the model name is a map *key*, not a value — so every real run recorded `metadata_sources.model` as `not_observed` or `user_option`, and the smoke mocks emitted a fictional `model` field that confirmed the parser instead of reality. Verified against claude 2.1.170, codex 0.128.0, gemini 0.44.1.
+- Consequence: Real runs now record `metadata_sources.model == "observed"` (primary model chosen by cost, context-window suffix like `[1m]` stripped), closing the Proof Quarter standing-zero for provider-observed metadata. Mocks now emit real installed-CLI shapes so the smoke exercises the true parse path. Provider output shapes stay volatile per AGENTS.md; the usage-map extractor is the documented contract, and a missing map degrades to byte-count capture rather than a fabricated model.
+- Revisit when: A provider CLI changes its usage-map shape or begins emitting a stable top-level model/effort field.
