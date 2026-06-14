@@ -1338,6 +1338,29 @@ try {
   assert(claudeTranscript.includes("--permission-mode plan"), "claude runner should use plan permission mode");
   assert(claudeTranscript.includes("mock claude structured response"), "claude transcript should capture parsed assistant text");
 
+  // Without --model, the adapter must observe the model from the real-shaped
+  // `modelUsage` map (model name is a key, not a value) and pick the primary
+  // model by cost. This is the regression guard for the Proof Quarter metadata bar.
+  const claudeObservedRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "observed guard",
+    "--runner",
+    "claude",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(claudeObservedRun.status === 0, "claude run without --model should complete");
+  const claudeObservedSummary = JSON.parse(claudeObservedRun.stdout);
+  assert(claudeObservedSummary.model === "claude-opus-4-8", "claude run should observe the primary model from modelUsage (cost-weighted, suffix stripped)");
+  assert(claudeObservedSummary.adapter.metadata_sources.model === "observed", "claude run without --model should mark model metadata as observed");
+  assert(claudeObservedSummary.cost_hint.amount === 0.0538, "claude run should observe total_cost_usd as cost hint");
+  assert(claudeObservedSummary.adapter.metadata_sources.cost_hint === "observed", "claude run should mark observed cost metadata");
+
   const claudeStreamRun = spawnSync("node", [
     cliPath,
     "run",
@@ -1433,14 +1456,15 @@ try {
   assert(codexSummary.adapter.argv.includes("--sandbox"), "mocked codex adapter should expose sandbox argv");
   assert(codexSummary.adapter.stderr_signal.level === "diagnostic", "mocked codex adapter should classify successful stderr as diagnostic");
   assert(codexSummary.adapter.parsed_output.format === "codex-jsonl", "mocked codex adapter should parse representative JSONL output");
-  assert(codexSummary.adapter.parsed_output.event_types.includes("message"), "mocked codex adapter should expose JSONL event types");
+  assert(codexSummary.adapter.parsed_output.event_types.includes("item.completed"), "mocked codex adapter should expose JSONL event types");
   assert(codexSummary.adapter.output_policy.max_tool_output_chars === 10, "mocked codex adapter should record token-governor output cap");
   assert(codexSummary.adapter.output_policy.rendering_truncated === true, "mocked codex adapter should record truncated provider rendering");
   assert(codexSummary.adapter.stdout_bytes > codexSummary.adapter.output_policy.max_tool_output_chars, "provider stdout should still be fully captured beyond rendered cap");
   tempPolicy.token_governor.max_tool_output_chars = 20000;
   await writeFile(tempPolicyPath, `${JSON.stringify(tempPolicy, null, 2)}\n`, "utf8");
-  assert(codexSummary.model === "codex-mock-jsonl", "mocked codex JSONL should populate observed model metadata");
-  assert(codexSummary.adapter.metadata_sources.model === "observed", "mocked codex JSONL should mark model metadata as observed");
+  // Installed codex `exec --json` emits no model id, so model stays not_observed (honest).
+  assert(codexSummary.model === null, "codex JSONL without a model field should leave model unobserved");
+  assert(codexSummary.adapter.metadata_sources.model === "not_observed", "codex JSONL should mark model metadata as not_observed");
   const codexEval = JSON.parse(run("node", [cliPath, "eval", codexSummary.id, "--cwd", tempRoot]).stdout);
   assert(codexEval.signals.adapter_stderr_signal === "diagnostic", "eval should expose diagnostic stderr without treating it as failure");
   const codexOutcome = JSON.parse(run("node", [cliPath, "outcome", codexSummary.id, "--cwd", tempRoot]).stdout);
@@ -2454,7 +2478,7 @@ async function installMockClaude(binDir) {
       "    exit 0",
       "    ;;",
       "  *\"--output-format json\"*)",
-      "    printf '%s\\n' '{\"type\":\"result\",\"result\":\"mock claude structured response\",\"model\":\"claude-mock-json\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}'",
+      "    printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"mock claude structured response\",\"total_cost_usd\":0.0538,\"usage\":{\"input_tokens\":12,\"output_tokens\":4},\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":441,\"outputTokens\":13,\"costUSD\":0.0005},\"claude-opus-4-8[1m]\":{\"inputTokens\":5075,\"outputTokens\":5,\"costUSD\":0.0533}}}'",
       "    exit 0",
       "    ;;",
       "esac",
@@ -2476,8 +2500,10 @@ async function installMockCodex(binDir) {
       "printf 'mock codex diagnostic\\n' >&2",
       "case \" $* \" in",
       "  *\" --json \"*)",
-      "    printf '%s\\n' '{\"type\":\"message\",\"message\":{\"content\":[{\"type\":\"output_text\",\"text\":\"mock codex structured response\"}]}}'",
-      "    printf '%s\\n' '{\"type\":\"final\",\"summary\":\"mock codex final summary\",\"model\":\"codex-mock-jsonl\"}'",
+      "    printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-mock\"}'",
+      "    printf '%s\\n' '{\"type\":\"turn.started\"}'",
+      "    printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"mock codex structured response\"}}'",
+      "    printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":24182,\"cached_input_tokens\":2432,\"output_tokens\":42}}'",
       "    exit 0",
       "    ;;",
       "esac",
@@ -2558,7 +2584,7 @@ async function installMockGemini(binDir) {
       "esac",
       "case \" $* \" in",
       "  *\"--output-format json\"*)",
-      "    printf '%s\\n' '{\"response\":\"mock gemini structured response\",\"model\":\"gemini-mock-json\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}'",
+      "    printf '%s\\n' '{\"session_id\":\"gemini-mock-session\",\"response\":\"mock gemini structured response\",\"stats\":{\"models\":{\"gemini-mock-json\":{\"api\":{\"totalRequests\":1},\"tokens\":{\"input\":10,\"output\":5,\"total\":15}}}}}'",
       "    exit 0",
       "    ;;",
       "esac",

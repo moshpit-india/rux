@@ -2902,6 +2902,11 @@ function extractAssistantTexts(value) {
       direct.push(...value[key].flatMap(extractAssistantTexts));
     }
   }
+  // Codex `exec --json` wraps assistant output in a singular `item` object
+  // (e.g. {type:"item.completed", item:{type:"agent_message", text:"..."}}).
+  if (value.item && typeof value.item === "object" && isMessageItem(value.item)) {
+    direct.push(...extractTextValue(value.item));
+  }
   if (value.delta !== undefined && looksAssistantEvent(value)) {
     direct.push(...extractTextValue(value.delta));
   }
@@ -2921,6 +2926,11 @@ function extractTextValue(value) {
   return [];
 }
 
+function isMessageItem(item) {
+  const type = String(item.type ?? item.role ?? item.kind ?? "").toLowerCase();
+  return /\b(agent_message|assistant|message|response|output_text|completion)\b/.test(type);
+}
+
 function looksAssistantEvent(value) {
   const marker = String(value.type ?? value.event ?? value.role ?? value.kind ?? "").toLowerCase();
   return /\b(assistant|message|response|completion|result|output)\b/.test(marker);
@@ -2928,14 +2938,107 @@ function looksAssistantEvent(value) {
 
 function extractObservedMetadata(values) {
   const flat = Array.isArray(values) ? values : [values];
-  const model = firstMetadataValue(flat, ["model", "model_name", "modelName"]);
+  // Installed provider CLIs do not expose the active model as a plain `model`
+  // field. Claude (`--output-format json`) and Gemini (`--output-format json`)
+  // both report it as a KEY inside a usage map (`modelUsage` / `stats.models`),
+  // so the direct key search misses it and we fall back to the usage map.
+  const model =
+    firstMetadataValue(flat, ["model", "model_name", "modelName"]) ??
+    modelFromUsageMaps(flat);
   const effort = firstMetadataValue(flat, ["effort", "reasoning_effort", "reasoningEffort"]);
   const cost = firstMetadataValue(flat, ["total_cost_usd", "cost_usd", "costUsd", "totalCostUsd"]);
   return {
-    model: model ? String(model) : null,
+    model: model ? cleanModelId(String(model)) : null,
     effort: effort ? String(effort) : null,
     cost_hint: normalizeObservedCost(cost)
   };
+}
+
+// Property names whose value is a map of model id -> per-model usage stats.
+const MODEL_USAGE_MAP_KEYS = ["modelUsage", "models"];
+
+function modelFromUsageMaps(values) {
+  for (const value of values) {
+    const map = findModelUsageMap(value);
+    if (map) {
+      const primary = pickPrimaryModel(map);
+      if (primary) return primary;
+    }
+  }
+  return null;
+}
+
+function findModelUsageMap(value, seen = new Set()) {
+  if (value === null || value === undefined || typeof value !== "object") return null;
+  if (seen.has(value)) return null;
+  seen.add(value);
+  for (const key of MODEL_USAGE_MAP_KEYS) {
+    if (isModelUsageMap(value[key])) return value[key];
+  }
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") {
+      const found = findModelUsageMap(child, seen);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function isModelUsageMap(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+  const entries = Object.entries(candidate);
+  if (entries.length === 0) return false;
+  // Every value must be a per-model stats object, and at least one key must
+  // look like a model id (guards against generic maps named "models").
+  return (
+    entries.every(([, stats]) => stats && typeof stats === "object" && !Array.isArray(stats)) &&
+    entries.some(([key]) => looksLikeModelId(key))
+  );
+}
+
+function looksLikeModelId(key) {
+  if (typeof key !== "string" || !key.trim()) return false;
+  if (/^(claude|gemini|gpt|o\d|codex|llama|mistral|deepseek|qwen|grok|gemma|sonnet|opus|haiku)/i.test(key)) {
+    return true;
+  }
+  // Generic versioned id: contains a letter, a hyphen, and a digit (e.g. "foo-3.1-pro").
+  return /[a-z]/i.test(key) && key.includes("-") && /\d/.test(key);
+}
+
+function pickPrimaryModel(map) {
+  let best = null;
+  let bestScore = -Infinity;
+  for (const [key, stats] of Object.entries(map)) {
+    if (!looksLikeModelId(key)) continue;
+    const score = modelUsageScore(stats);
+    if (best === null || score > bestScore) {
+      best = key;
+      bestScore = score;
+    }
+  }
+  return best ? cleanModelId(best) : null;
+}
+
+function modelUsageScore(stats) {
+  if (!stats || typeof stats !== "object") return 0;
+  const cost = Number(stats.costUSD ?? stats.cost_usd ?? stats.totalCostUsd ?? stats.costUsd);
+  if (Number.isFinite(cost) && cost > 0) return cost;
+  return sumTokenUsage(stats);
+}
+
+function sumTokenUsage(stats) {
+  const tokens = stats.tokens && typeof stats.tokens === "object" ? stats.tokens : stats;
+  const total = Number(tokens.total ?? tokens.totalTokens);
+  if (Number.isFinite(total) && total > 0) return total;
+  const input = Number(tokens.input ?? tokens.inputTokens ?? tokens.prompt ?? 0);
+  const output = Number(tokens.output ?? tokens.outputTokens ?? tokens.candidates ?? 0);
+  return (Number.isFinite(input) ? input : 0) + (Number.isFinite(output) ? output : 0);
+}
+
+function cleanModelId(id) {
+  // Strip a trailing context-window tag such as the "[1m]" in
+  // "claude-opus-4-8[1m]" so the recorded id matches the canonical model name.
+  return String(id).replace(/\s*\[[^\]]*\]\s*$/, "").trim();
 }
 
 function firstMetadataValue(values, keys) {
