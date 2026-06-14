@@ -1361,6 +1361,25 @@ try {
   assert(claudeObservedSummary.cost_hint.amount === 0.0538, "claude run should observe total_cost_usd as cost hint");
   assert(claudeObservedSummary.adapter.metadata_sources.cost_hint === "observed", "claude run should mark observed cost metadata");
 
+  // Cross-unit guard: a zero-cost entry with huge token counts must not beat a
+  // cost-bearing primary. Scoring stays on one dimension (cost) per usage map.
+  const claudeCostMixRun = spawnSync("node", [
+    cliPath,
+    "run",
+    "cost mix guard",
+    "--runner",
+    "claude",
+    "--allow-dirty",
+    "--cwd",
+    tempRoot
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${tempBin}:${process.env.PATH ?? ""}` }
+  });
+  assert(claudeCostMixRun.status === 0, "claude cost-mix run should complete");
+  const claudeCostMixSummary = JSON.parse(claudeCostMixRun.stdout);
+  assert(claudeCostMixSummary.model === "claude-opus-4-8", "primary model must be chosen by cost, not token count, when costs are present");
+
   const claudeStreamRun = spawnSync("node", [
     cliPath,
     "run",
@@ -2475,6 +2494,10 @@ async function installMockClaude(binDir) {
       "    printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-stream-mock\"}'",
       "    printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"mock claude streamed chunk\"}]}}'",
       "    printf '%s\\n' '{\"type\":\"result\",\"result\":\"mock claude streamed response\",\"model\":\"claude-stream-mock\",\"total_cost_usd\":0.07,\"duration_ms\":1200}'",
+      "    exit 0",
+      "    ;;",
+      "  *\"cost mix guard\"*)",
+      "    printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"mock claude cost mix response\",\"total_cost_usd\":0.05,\"modelUsage\":{\"claude-haiku-4-5-20251001\":{\"inputTokens\":99999,\"outputTokens\":99999,\"costUSD\":0},\"claude-opus-4-8[1m]\":{\"inputTokens\":5,\"outputTokens\":5,\"costUSD\":0.05}}}'",
       "    exit 0",
       "    ;;",
       "  *\"--output-format json\"*)",

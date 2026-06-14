@@ -3006,24 +3006,29 @@ function looksLikeModelId(key) {
 }
 
 function pickPrimaryModel(map) {
+  const entries = Object.entries(map).filter(([key]) => looksLikeModelId(key));
+  if (entries.length === 0) return null;
+  // Score every entry on a single dimension so we never compare dollars
+  // against token counts: prefer cost when any entry carries a positive cost,
+  // otherwise fall back to token totals for all entries.
+  const useCost = entries.some(([, stats]) => modelEntryCost(stats) > 0);
+  const scoreOf = (stats) => (useCost ? modelEntryCost(stats) : sumTokenUsage(stats));
   let best = null;
   let bestScore = -Infinity;
-  for (const [key, stats] of Object.entries(map)) {
-    if (!looksLikeModelId(key)) continue;
-    const score = modelUsageScore(stats);
-    if (best === null || score > bestScore) {
+  for (const [key, stats] of entries) {
+    const value = scoreOf(stats);
+    if (best === null || value > bestScore) {
       best = key;
-      bestScore = score;
+      bestScore = value;
     }
   }
   return best ? cleanModelId(best) : null;
 }
 
-function modelUsageScore(stats) {
+function modelEntryCost(stats) {
   if (!stats || typeof stats !== "object") return 0;
   const cost = Number(stats.costUSD ?? stats.cost_usd ?? stats.totalCostUsd ?? stats.costUsd);
-  if (Number.isFinite(cost) && cost > 0) return cost;
-  return sumTokenUsage(stats);
+  return Number.isFinite(cost) && cost > 0 ? cost : 0;
 }
 
 function sumTokenUsage(stats) {
