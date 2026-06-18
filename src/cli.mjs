@@ -30,6 +30,7 @@ const knownOptionNames = new Set([
   "force",
   "from",
   "implementer-runner",
+  "in-session",
   "include-probes",
   "include-transcripts",
   "json",
@@ -177,7 +178,7 @@ Usage:
   ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
   ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
   ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
-  ${CLI_NAME} suggest "<task>" [--include-probes] [--cwd PATH] [--json]
+  ${CLI_NAME} suggest "<task>" [--in-session claude|codex|gemini] [--include-probes] [--cwd PATH] [--json]
   ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH] [--json]
   ${CLI_NAME} status [--cwd PATH] [--json]
   ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts] [--json]
@@ -369,12 +370,26 @@ function formatSuggestHuman(result) {
     `Kind: ${result.task_kind ?? "unspecified"}`
   ];
 
-  if (recommendation.runner) {
+  if (recommendation.continue_in_session) {
+    // Attribute the maturity to whose evidence it is — never render it as
+    // confidence in staying, which we do not have.
+    const evidenceLine = recommendation.evidence_runner
+      ? `Evidence: ${recommendation.evidence_runner} history is ${maturity.level ?? "unknown"} (${maturity.runs ?? 0} run(s)); staying avoids handoff cost`
+      : "Evidence: none eligible yet; staying avoids handoff risk";
+    lines.push(
+      `Recommendation: continue in current session (${recommendation.runner}, no handoff)`,
+      evidenceLine,
+      `Reason: ${recommendation.reason ?? "No reason recorded."}`
+    );
+  } else if (recommendation.runner) {
     lines.push(
       `Recommendation: ${recommendation.runner}/${recommendation.roster ?? "solo"} ${recommendation.model ?? "default-model"} ${recommendation.effort ?? "default-effort"}`,
       `Confidence: ${recommendation.confidence ?? "unknown"}, maturity ${maturity.level ?? "unknown"} from ${maturity.runs ?? 0} run(s)`,
       `Reason: ${recommendation.reason ?? "No reason recorded."}`
     );
+    if (recommendation.handoff === "recommended") {
+      lines.push(`Handoff: recommended over staying in ${recommendation.in_session}`);
+    }
   } else {
     lines.push(
       "Recommendation: none yet",
@@ -3409,11 +3424,28 @@ async function suggestRun(args) {
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
   emitResult(options, buildRecommendation(task, events, {
-    includeProbes: options["include-probes"] === true
+    includeProbes: options["include-probes"] === true,
+    inSession: resolveInSessionRunner(options["in-session"])
   }), formatSuggestHuman);
 }
 
-function buildRecommendation(task, events, { includeProbes = false } = {}) {
+// --in-session names the runner already doing the work, so suggest can weigh
+// handoff cost: the asking agent already holds the local context. Reject "fake"
+// (a smoke stand-in, never a real session) and unknown runners with a clear hint.
+function resolveInSessionRunner(value) {
+  if (value === undefined) return null;
+  if (value === true || typeof value !== "string" || value.trim() === "") {
+    throw new Error(`--in-session needs a runner name, e.g. ${CLI_NAME} suggest "<task>" --in-session codex`);
+  }
+  const runner = value.trim();
+  if (!runnerDefinitions[runner] || runner === "fake") {
+    const real = Object.keys(runnerDefinitions).filter((name) => name !== "fake").join("|");
+    throw new Error(`Unknown --in-session runner "${runner}". Use one of: ${real}.`);
+  }
+  return runner;
+}
+
+function buildRecommendation(task, events, { includeProbes = false, inSession = null } = {}) {
   const runs = topLevelRuns(runsWithAppendedChecks(events));
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
@@ -3466,10 +3498,14 @@ function buildRecommendation(task, events, { includeProbes = false } = {}) {
         }
       };
 
+  const recommendation = inSession
+    ? applyInSessionDecision({ suggestion, best, inSession })
+    : suggestion;
+
   return {
     task,
     task_kind: taskKind,
-    recommendation: suggestion,
+    recommendation,
     evidence: {
       eligible_runs: eligibility.eligible.length,
       same_kind_runs: sameKind.length,
@@ -3478,6 +3514,61 @@ function buildRecommendation(task, events, { includeProbes = false } = {}) {
       ignored_reasons: countBy(eligibility.ignored.map((item) => item.reason)),
       maturity: summarizeEvidenceMaturity(eligibility.eligible, verdicts, marks)
     }
+  };
+}
+
+// Real routing decisions are made mid-session by an agent that already holds the
+// local context, so a handoff to another runner has real cost. Treat "continue
+// in the current session" as a first-class candidate and only recommend a handoff
+// when the evidence advantage clearly outweighs that cost. The bar is deliberately
+// set at directional maturity (3+ labeled runs): one or two labeled runs are never
+// a clear enough advantage to justify dropping the context the asker already has.
+function applyInSessionDecision({ suggestion, best, inSession }) {
+  const evidenceRunner = best ? best.runner : null;
+  const maturity = suggestion.maturity ?? evidenceMaturityForGroup(null);
+  const level = maturity.level ?? "none";
+  const runs = maturity.runs ?? 0;
+
+  // Evidence already favors the in-session runner: staying matches the evidence
+  // AND skips the handoff. Strictly dominant, regardless of maturity.
+  const evidenceMatchesSession = Boolean(best) && evidenceRunner === inSession;
+  // A different runner only wins if its advantage clears the directional bar.
+  const advantageClearsBar =
+    Boolean(best) && evidenceRunner !== inSession && maturityRank(level) >= maturityRank("directional");
+
+  if (advantageClearsBar) {
+    return {
+      ...suggestion,
+      in_session: inSession,
+      continue_in_session: false,
+      handoff: "recommended",
+      evidence_runner: evidenceRunner,
+      reason: `${suggestion.reason} Evidence for ${evidenceRunner} is ${level} (${runs} run(s)) — a clear enough advantage to justify handing off from the current ${inSession} session.`
+    };
+  }
+
+  const reason = evidenceMatchesSession
+    ? `Local evidence also favors ${inSession} (maturity ${level}, ${runs} run(s)); staying in the current ${inSession} session matches the evidence and avoids handoff cost.`
+    : evidenceRunner
+      ? `Evidence for ${evidenceRunner} is only ${level} (${runs} run(s)) — not a clear enough advantage to justify a handoff. Continue in the current ${inSession} session; you already have the local context.`
+      : `No eligible local evidence yet — staying in the current ${inSession} session avoids handoff risk while you capture a checked run.`;
+
+  return {
+    runner: inSession,
+    roster: "solo",
+    model: null,
+    effort: null,
+    in_session: inSession,
+    continue_in_session: true,
+    handoff: "skip",
+    confidence: "in_session_no_handoff",
+    // Honest: this maturity describes evidence_runner's history, not confidence in
+    // staying. evidence_runner attributes it so the surface never overclaims.
+    maturity,
+    evidence_runner: evidenceRunner,
+    reason,
+    evidence_runs: suggestion.evidence_runs ?? [],
+    stats: suggestion.stats
   };
 }
 

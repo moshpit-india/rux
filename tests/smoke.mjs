@@ -2178,6 +2178,57 @@ try {
   assert(suggestion.evidence.ignored_reasons.provider_smoke >= 3, "suggest should ignore provider-smoke runs");
   assert(suggestion.evidence.ignored_reasons.probe_run >= 1, "suggest should ignore probe runs by default");
 
+  // --in-session weighs handoff cost: an agent already holding the local context
+  // should not be told to hand off on thin evidence. tempRoot's best is thin claude.
+  const thinSameStay = JSON.parse(run("node", [cliPath, "suggest", "guard", "--cwd", tempRoot, "--in-session", "claude"]).stdout);
+  assert(thinSameStay.recommendation.continue_in_session === true, "in-session matching the evidence runner should stay in session");
+  assert(thinSameStay.recommendation.handoff === "skip", "staying in session should skip the handoff");
+  assert(thinSameStay.recommendation.runner === "claude", "in-session stay should name the current-session runner");
+  assert(thinSameStay.recommendation.evidence_runner === "claude", "in-session stay should attribute the maturity to its evidence runner");
+  const thinOtherStay = JSON.parse(run("node", [cliPath, "suggest", "guard", "--cwd", tempRoot, "--in-session", "codex"]).stdout);
+  assert(thinOtherStay.recommendation.continue_in_session === true, "thin evidence for a different runner should not justify a handoff");
+  assert(thinOtherStay.recommendation.runner === "codex", "thin in-session stay should keep the asking-session runner");
+  assert(thinOtherStay.recommendation.reason.includes("not a clear enough advantage"), "thin stay reason should explain the handoff is not justified");
+
+  // Build directional claude evidence (3 labeled runs) to prove a real advantage still hands off.
+  const inSessionRoot = join(tempRoot, "in-session-directional");
+  await mkdir(inSessionRoot, { recursive: true });
+  run("git", ["init"], inSessionRoot);
+  await writeFile(join(inSessionRoot, "README.md"), "# In Session\n", "utf8");
+  run("git", ["add", "README.md"], inSessionRoot);
+  run("git", ["commit", "-m", "initial"], inSessionRoot, {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  });
+  const gitIdentity = {
+    GIT_AUTHOR_NAME: "Rux Smoke",
+    GIT_AUTHOR_EMAIL: "smoke@example.com",
+    GIT_COMMITTER_NAME: "Rux Smoke",
+    GIT_COMMITTER_EMAIL: "smoke@example.com"
+  };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const feature = `feature-${attempt}.txt`;
+    await writeFile(join(inSessionRoot, feature), `feature ${attempt}\n`, "utf8");
+    run("node", [cliPath, "record", "implement a feature", "--runner", "claude", "--task-kind", "feature", "--check", "node --version", "--write-scope", feature, "--cwd", inSessionRoot]);
+    run("git", ["add", feature], inSessionRoot);
+    run("git", ["commit", "-m", `feature ${attempt}`], inSessionRoot, gitIdentity);
+  }
+  const directionalPlain = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--cwd", inSessionRoot]).stdout);
+  assert(directionalPlain.recommendation.runner === "claude", "three labeled claude runs should recommend claude");
+  assert(directionalPlain.recommendation.maturity.level === "directional", "three labeled runs should reach directional maturity");
+  const directionalHandoff = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--cwd", inSessionRoot, "--in-session", "codex"]).stdout);
+  assert(directionalHandoff.recommendation.continue_in_session === false, "directional evidence for another runner should still recommend a handoff");
+  assert(directionalHandoff.recommendation.handoff === "recommended", "directional advantage should label the handoff");
+  assert(directionalHandoff.recommendation.runner === "claude", "directional handoff should name the evidence runner, not the current session");
+  assert(directionalHandoff.recommendation.reason.includes("clear enough advantage"), "directional handoff reason should explain the advantage clears the bar");
+  const directionalSame = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--cwd", inSessionRoot, "--in-session", "claude"]).stdout);
+  assert(directionalSame.recommendation.continue_in_session === true, "matching the directional evidence runner should still stay (no handoff cost)");
+  const badInSession = spawnSync("node", [cliPath, "suggest", "guard", "--cwd", tempRoot, "--in-session", "fake"], { encoding: "utf8" });
+  assert(badInSession.status !== 0, "fake is a smoke stand-in, not a real session, and should be rejected");
+  assert(badInSession.stderr.includes("Unknown --in-session runner"), "in-session error should name the problem and list real runners");
+
   const rankResult = run("node", [cliPath, "rank", "--task-kind", "unspecified", "--cwd", tempRoot]);
   const ranking = JSON.parse(rankResult.stdout);
   assert(ranking.evidence.eligible_runs === 4, "rank should use eligible live provider runs for the scope");
