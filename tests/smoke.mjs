@@ -467,6 +467,44 @@ try {
   const reclassificationSuggestion = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--cwd", reclassificationRoot]).stdout);
   assert(reclassificationSuggestion.evidence.eligible_runs === 4, "suggest should consume effective labels for recommendation evidence");
 
+  // suggest must match evidence on the effective (changed-file corrected) kind, not
+  // the stored "docs" a run was mislabeled with before correction. The genuine
+  // feature run is a distractor so same_kind is non-empty even on the old path:
+  // pre-fix only the feature run matches (same_kind === 1); post-fix the corrected
+  // docs-mislabel matches too (same_kind === 2).
+  const effectiveKindRoot = join(tempRoot, "effective-kind-suggest");
+  await mkdir(join(effectiveKindRoot, ".rux", "ledger"), { recursive: true });
+  const eligibleCheck = [{ source: "run_check", command: "fixture-check", exit_code: 0, changed_files: [] }];
+  const mislabeledDocsRun = {
+    schema_version: 1, type: "run", id: "20260610T010101Z-codedocs1", purpose: "task_run",
+    source: "live", confidence: "high", task: "update the readme docs",
+    task_kind: "docs", task_kind_source: "legacy_inferred", task_kind_suggestion: null,
+    runner: "codex", roster: "solo", role: "runner", status: "ok", status_reason: "completed",
+    changed_files: ["src/feature.mjs"], write_scope: { allowed: [], violations: [] },
+    checks: eligibleCheck, adapter: { runner: "codex", exit_code: 0, timed_out: false }
+  };
+  const genuineFeatureRun = {
+    schema_version: 1, type: "run", id: "20260610T020202Z-feature01", purpose: "task_run",
+    source: "live", confidence: "high", task: "implement a feature",
+    task_kind: "feature", task_kind_source: "user", task_kind_suggestion: null,
+    runner: "codex", roster: "solo", role: "runner", status: "ok", status_reason: "completed",
+    changed_files: ["src/other.mjs"], write_scope: { allowed: [], violations: [] },
+    checks: eligibleCheck, adapter: { runner: "codex", exit_code: 0, timed_out: false }
+  };
+  await writeFile(
+    join(effectiveKindRoot, ".rux", "ledger", "2026-06-10.jsonl"),
+    `${JSON.stringify(mislabeledDocsRun)}\n${JSON.stringify(genuineFeatureRun)}\n`,
+    "utf8"
+  );
+  const effectiveKindSuggestion = JSON.parse(run("node", [cliPath, "suggest", "implement a feature", "--task-kind", "feature", "--cwd", effectiveKindRoot]).stdout);
+  assert(effectiveKindSuggestion.evidence.same_kind_runs === 2, "suggest should match a mislabeled-docs code run on its effective feature kind, not its stored docs label");
+  assert(effectiveKindSuggestion.recommendation.evidence_runs.includes("20260610T010101Z-codedocs1"), "suggest evidence runs should include the corrected mislabeled-docs run");
+  assert(effectiveKindSuggestion.task_kind === "feature" && effectiveKindSuggestion.task_kind_source === "user", "explicit --task-kind should drive an authoritative user-sourced query kind");
+  // Without --task-kind the query kind stays honestly unspecified rather than a keyword guess.
+  const unspecifiedQuery = JSON.parse(run("node", [cliPath, "suggest", "update the readme docs", "--cwd", effectiveKindRoot]).stdout);
+  assert(unspecifiedQuery.task_kind === "unspecified" && unspecifiedQuery.task_kind_source === "unspecified", "suggest without --task-kind should report an unspecified, non-fabricated query kind");
+  assert(unspecifiedQuery.recommendation.reason.includes("unspecified"), "unspecified suggest should say it is using all eligible history");
+
   const runResult = run("node", [
     cliPath,
     "run",

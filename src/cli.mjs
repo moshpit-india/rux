@@ -3274,7 +3274,9 @@ async function planRun(args) {
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
   const policy = await loadPolicy(cwd);
-  const recommendation = buildRecommendation(task, events);
+  const recommendation = buildRecommendation(task, events, {
+    queryTaskKind: resolveQueryTaskKind(task, options)
+  });
   const metadata = metadataFromOptions(options);
   const taskKind = recommendation.task_kind;
   const explicitRunner = options.runner ? normalizeRunner(String(options.runner)) : null;
@@ -3425,7 +3427,8 @@ async function suggestRun(args) {
   const events = await readLedger(cwd);
   emitResult(options, buildRecommendation(task, events, {
     includeProbes: options["include-probes"] === true,
-    inSession: resolveInSessionRunner(options["in-session"])
+    inSession: resolveInSessionRunner(options["in-session"]),
+    queryTaskKind: resolveQueryTaskKind(task, options)
   }), formatSuggestHuman);
 }
 
@@ -3445,13 +3448,23 @@ function resolveInSessionRunner(value) {
   return runner;
 }
 
-function buildRecommendation(task, events, { includeProbes = false, inSession = null } = {}) {
+function buildRecommendation(task, events, { includeProbes = false, inSession = null, queryTaskKind = null } = {}) {
   const runs = topLevelRuns(runsWithAppendedChecks(events));
   const verdicts = latestVerdictByRun(events);
   const marks = lifecycleMarksByRun(events);
-  const taskKind = classifyTask(task);
+  // Query-side kind: an explicit --task-kind is authoritative; otherwise stay
+  // unspecified rather than trusting a naive keyword guess (which once labeled
+  // code tasks "docs" and matched them against the wrong evidence).
+  const resolvedQueryKind = queryTaskKind ?? resolveQueryTaskKind(task);
+  const taskKind = resolvedQueryKind.task_kind;
+  const taskKindSpecified = resolvedQueryKind.task_kind_source === "user";
   const eligibility = partitionRecommendationEvidence(runs, verdicts, marks, { includeProbes });
-  const sameKind = eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKind);
+  // Evidence-side kind: match on each run's effective/corrected kind, so a run
+  // mislabeled "docs" at write time but corrected from its changed files matches
+  // its true kind. With no specified query kind, match nothing and use all history.
+  const sameKind = taskKindSpecified
+    ? eligibility.eligible.filter((run) => effectiveTaskKind(run) === taskKind)
+    : [];
   const evidencePool = sameKind.length > 0 ? sameKind : eligibility.eligible;
   const groups = summarizeEvidenceGroups(evidencePool, verdicts, marks);
   const best = groups.find((group) => group.score > 0) ?? null;
@@ -3464,9 +3477,11 @@ function buildRecommendation(task, events, { includeProbes = false, inSession = 
       effort: best.effort,
       confidence: best.total >= 3 ? "local_evidence" : "thin_local_evidence",
       maturity: evidenceMaturityForGroup(best),
-      reason: sameKind.length > 0
-        ? `Best labeled live history for ${taskKind} tasks.`
-        : `No labeled live history for ${taskKind} tasks yet; using all eligible local history.`,
+      reason: !taskKindSpecified
+        ? "Task kind unspecified; using all eligible local history. Pass --task-kind to match by kind."
+        : sameKind.length > 0
+          ? `Best labeled live history for ${taskKind} tasks.`
+          : `No labeled live history for ${taskKind} tasks yet; using all eligible local history.`,
         evidence_runs: best.evidence_runs,
         stats: {
           labeled_runs: best.total,
@@ -3505,6 +3520,7 @@ function buildRecommendation(task, events, { includeProbes = false, inSession = 
   return {
     task,
     task_kind: taskKind,
+    task_kind_source: resolvedQueryKind.task_kind_source,
     recommendation,
     evidence: {
       eligible_runs: eligibility.eligible.length,
@@ -4242,13 +4258,13 @@ async function rankRuns(args) {
   const includeProbes = options["include-probes"] === true;
   const eligibility = partitionRecommendationEvidence(runs, verdicts, marks, { includeProbes });
   const eligible = taskKindFilter
-    ? eligibility.eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKindFilter)
+    ? eligibility.eligible.filter((run) => effectiveTaskKind(run) === taskKindFilter)
     : eligibility.eligible;
-  const taskKinds = unique(eligible.map((run) => run.task_kind ?? classifyTask(run.task))).sort();
+  const taskKinds = unique(eligible.map((run) => effectiveTaskKind(run))).sort();
   const rankings = taskKinds.map((taskKind) => ({
     task_kind: taskKind,
     candidates: summarizeEvidenceGroups(
-      eligible.filter((run) => (run.task_kind ?? classifyTask(run.task)) === taskKind),
+      eligible.filter((run) => effectiveTaskKind(run) === taskKind),
       verdicts,
       marks
     )
@@ -5287,6 +5303,42 @@ function suggestTaskKind(task, changedFiles = []) {
   if (docs === files.length) return "docs";
   if (code > 0) return classifyTask(task ?? "") === "bugfix" ? "bugfix" : "feature";
   return classifyTask(task ?? "");
+}
+
+// The most trustworthy task-kind for an evidence run, in order:
+//   1. an explicit user label is authoritative;
+//   2. else a kind corrected from what the run actually changed (changed-file
+//      extensions, per the Wave 2 work) — this overrides a write-time mislabel
+//      such as "docs" on a code run;
+//   3. else the stored kind as written.
+// We correct only from a real file signal, never from a keyword guess, so a
+// genuinely unspecified run stays unspecified rather than being fabricated a kind.
+function effectiveTaskKind(run) {
+  if (!run || typeof run !== "object") return "unspecified";
+  const source = run.task_kind_source ?? "legacy_inferred";
+  const stored = run.task_kind;
+  if (source === "user" && stored && stored !== "unspecified") {
+    return stored;
+  }
+  const changedFiles = Array.isArray(run.changed_files) ? run.changed_files : [];
+  if (changedFiles.length > 0) {
+    const corrected = suggestTaskKind(run.task ?? "", changedFiles);
+    if (corrected && corrected !== "unspecified") {
+      return corrected;
+    }
+  }
+  if (stored && stored !== "unspecified") return stored;
+  return "unspecified";
+}
+
+// Resolve the task-kind to use for a pre-run query (suggest/plan). There are no
+// changed files yet, so the only trustworthy signal is an explicit --task-kind;
+// absent that, stay honestly unspecified rather than assuming a keyword guess.
+function resolveQueryTaskKind(task, options = {}) {
+  if (options["task-kind"] !== undefined && options["task-kind"] !== true) {
+    return { task_kind: normalizeTaskKind(options["task-kind"]), task_kind_source: "user" };
+  }
+  return { task_kind: "unspecified", task_kind_source: "unspecified" };
 }
 
 function latestVerdictByRun(events) {
