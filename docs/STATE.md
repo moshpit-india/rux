@@ -4,7 +4,7 @@ Last updated: 2026-06-12
 
 ## One-Line Summary
 
-Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current npm release is `@moshpits/rux@0.2.2`, and the release posture is still test first: local verification before every publish.
+Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current npm release is `@moshpits/rux@0.2.3`, and the release posture is still test first: local verification before every publish.
 
 ## Decisions
 
@@ -14,6 +14,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - Keep runtime naming centralized in `src/identity.mjs`.
 - NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Public package metadata lives under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin.
 - `@moshpits/rux@0.2.2` is the token-governor release. It keeps the `0.2.1` opt-in Claude `--stream` mode and adds advisory `token_governor` policy plus visible provider-output capping for Rux-wrapped provider runs while preserving full transcript output.
+- `@moshpits/rux@0.2.3` is the routing-quality release. It adds `rux suggest --in-session claude|codex|gemini` so suggest weighs handoff cost instead of assuming a cold start, matches query and evidence on the effective (changed-file corrected) task kind rather than mislabeled stored kinds, and observes provider model metadata from real provider usage maps. These are the first proof-quarter friction fixes addressing the day-6 finding that `suggest` recommended unwarranted handoffs.
 - Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
 - Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
 - Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
@@ -130,4 +131,4 @@ Recorded as they emerge from the ledgers; these are findings, not decisions.
 
 ## Next Action
 
-The `0.2.2` package carries the first token-governor enforcement slice, and Wave 2 is exited. The current large goal is the pre-registered proof quarter (`docs/PROOF.md`, 2026-06-12 -> 2026-09-12): instrument every real routing decision — recommendation, choice, outcome — until the ledger proves or honestly refutes that `rux suggest` changes decisions for the better. The decision discipline is propagated to all Moshpit repos via their `AGENTS.md` (canonical block in this repo's `AGENTS.md`) plus user-level Claude/Codex/Gemini instruction files. Build work this quarter is limited to what the protocol needs: decision/adherence events, the scorecard view, deeper token-governor enforcement, and quota-blocking friction fixes. Day-6 review (see Proof Quarter Observations): 5 of 8 bar items cleared; the substantive finding is that `suggest` recommends unwarranted handoffs, with two friction-fix chips in flight.
+The `0.2.3` package carries the first proof-quarter routing-quality fixes (`suggest --in-session`, effective task-kind matching, observed model metadata), on top of the `0.2.2` token-governor slice, and Wave 2 is exited. The current large goal is the pre-registered proof quarter (`docs/PROOF.md`, 2026-06-12 -> 2026-09-12): instrument every real routing decision — recommendation, choice, outcome — until the ledger proves or honestly refutes that `rux suggest` changes decisions for the better. The decision discipline is propagated to all Moshpit repos via their `AGENTS.md` (canonical block in this repo's `AGENTS.md`) plus user-level Claude/Codex/Gemini instruction files. Build work this quarter is limited to what the protocol needs: decision/adherence events, the scorecard view, deeper token-governor enforcement, and quota-blocking friction fixes. Day-6 review (see Proof Quarter Observations): 5 of 8 bar items cleared; the substantive finding is that `suggest` recommends unwarranted handoffs, with two friction-fix chips in flight.
