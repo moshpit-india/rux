@@ -41,4 +41,4 @@ Only what the protocol needs: a first-class decision/adherence event schema to r
 
 ## Amendments
 
-- (none — add dated entries here; never edit the bar above retroactively)
+- 2026-06-19: The `--in-session <cli>` signal (rux 0.2.2+, now wired into the propagated agent discipline) lets `suggest` weigh handoff cost and therefore agree with the in-session runner more often. This shrinks the divergence test set: fewer recommendations differ from habit. Clarification for the kill-check (does not edit the bar): a "good divergence" should be read as a case where `suggest` recommends a *different* runner than the in-session one and is right to (judged by checks/verdicts/lifecycle marks), not merely any operator override. Overrides of cold-start recommendations that simply restate "continue where I already am" are no longer the interesting signal now that in-session is first-class.

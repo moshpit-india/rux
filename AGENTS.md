@@ -31,7 +31,7 @@ Runtime naming lives in `src/identity.mjs`; package publishing stays gated by lo
 
 All Moshpit repos follow this discipline for substantial agent work (implementation, review, repair — not trivial edits). The pre-registered bar lives in `docs/PROOF.md` in this repo. Rux 0.2.0+ is installed globally as `rux`.
 
-1. Ask before working: `rux suggest "<task>" --cwd "$PWD"` (add `rux plan "<task>" --cwd "$PWD"` for large work). Note the recommendation and its maturity label.
+1. Ask before working: `rux suggest "<task>" --in-session <your-cli> --cwd "$PWD"` where <your-cli> is claude|codex|gemini — the agent you are right now (so suggest can weigh handoff cost instead of assuming a cold start). Add `rux plan "<task>" --cwd "$PWD"` for large work. Note the recommendation and its maturity label, and whether it said to continue in-session or hand off.
    - Apply the committed `rux.policy.json` `token_governor` block as the operating policy for token discipline: bound tool output, keep full logs outside model context, create handoffs before long sessions continue, and require a budget reason plus expected artifact for expensive models, high effort, subagents, or review agents.
 2. Capture the work:
    - Delegating to a provider CLI: `rux run "<task>" --runner claude|codex|gemini --provider-mode plan|write --task-kind <kind> --check "<repo check>" --cwd "$PWD"`, with `--write-scope "path[,path...]"` for tightly scoped edits. Do not pass `--allow-dirty` unless the dirty files are intentionally part of the provider context and the user accepted that risk.
