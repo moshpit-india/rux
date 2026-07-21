@@ -1490,7 +1490,7 @@ function buildScorecardCoverage({ routingReports, inWindow, outsideWindow, decis
       { stage: "routing_report_stamped", count: decisions.length, ids: decisions.map((decision) => decision.report_id) },
       { stage: "linked_to_run", count: linked.length, ids: citedRunIds(linked) },
       { stage: "linked_run_present_in_ledger", count: runFound.length, ids: citedRunIds(runFound) },
-      { stage: "check_verdict_or_mark_on_run", count: instrumented.length, ids: citedRunIds(instrumented) },
+      { stage: "check_or_verdict_on_run", count: instrumented.length, ids: citedRunIds(instrumented) },
       { stage: "outcome_judgeable", count: outcomeBearing.length, ids: citedRunIds(outcomeBearing) }
     ]
   };
@@ -1540,8 +1540,11 @@ function buildRoutingDecision({ report, runsById, childrenByParent, verdicts, ma
       : null,
     judgment: judged.judgment,
     judgment_reason: judged.reason,
+    // PROOF.md item 3 is literally "a check result or human verdict on that run".
+    // Lifecycle marks judge win/loss but do not make a decision instrumented, or a
+    // mark-only decision would inflate the count past the immutable bar's intent.
     instrumented: Boolean(run) && (
-      (Array.isArray(run.checks) && run.checks.length > 0) || Boolean(verdict) || runMarks.length > 0
+      (Array.isArray(run.checks) && run.checks.length > 0) || Boolean(verdict)
     ),
     note: report.note ?? "",
     parse_gaps: unique(parseGaps)
@@ -1871,7 +1874,7 @@ function formatScorecardHuman(scorecard) {
     `${PRODUCT_NAME} routing scorecard`,
     `Repo: ${scorecard.cwd}`,
     `Window: ${scorecard.window.start} .. ${scorecard.window.end} (${scorecard.window.source})`,
-    `Decisions: ${scorecard.adherence.decisions} stamped, ${scorecard.coverage.instrumented_decisions} instrumented (report + linked run + check/verdict/mark)`,
+    `Decisions: ${scorecard.adherence.decisions} stamped, ${scorecard.coverage.instrumented_decisions} instrumented (report + linked run + check or verdict)`,
     `Adherence: ${formatPercent(scorecard.adherence.adherence_rate)} (${scorecard.adherence.followed} followed / ${scorecard.adherence.overridden} overridden / ${scorecard.adherence.unclear} unclear)`
   ];
 

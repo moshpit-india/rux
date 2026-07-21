@@ -516,6 +516,16 @@ try {
   await writeFile(scorecardLedgerPath, scorecardFixture, "utf8");
   const scorecard = JSON.parse(run("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot]).stdout);
 
+  // A repo with no routing reports at all must still produce a usable, honest view.
+  const emptyScorecardRoot = join(tempRoot, "routing-scorecard-empty");
+  await mkdir(join(emptyScorecardRoot, ".rux", "ledger"), { recursive: true });
+  const emptyScorecard = JSON.parse(run("node", [cliPath, "status", "--scorecard", "--cwd", emptyScorecardRoot]).stdout);
+  assert(emptyScorecard.adherence.decisions === 0, "an empty ledger should score zero routing decisions");
+  assert(emptyScorecard.adherence.adherence_rate === null, "adherence rate should be null rather than fabricated on an empty ledger");
+  assert(emptyScorecard.divergence.test_set.win_rate === null, "divergence win-rate should be null rather than fabricated on an empty ledger");
+  assert(emptyScorecard.regret.length === 0, "an empty ledger should report no regret cases");
+  assert(emptyScorecard.kill_check.ready_to_judge === false, "an empty ledger should never be judgeable");
+
   assert(scorecard.view === "routing_scorecard", "status --scorecard should emit the routing scorecard view");
   assert(scorecard.window.start === "2026-06-12" && scorecard.window.end === "2026-09-12", "scorecard should default to the PROOF.md pre-registered window");
   assert(scorecard.coverage.routing_reports_total === 8, "scorecard should count every routing report in the ledger");
@@ -596,6 +606,7 @@ try {
   assert(scorecardTty.stdout.includes("Rux routing scorecard"), "human scorecard should name the surface");
   assert(scorecardTty.stdout.includes("20260621T090000Z-d2000002"), "human scorecard should cite run IDs inline");
   assert(scorecardTty.stdout.includes("Regret cases"), "human scorecard should show regret cases");
+  assert(scorecardTty.stdout.includes("check or verdict"), "human scorecard should state the instrumented-decision definition from PROOF.md");
 
   const scorecardLedgerAfter = await readFile(scorecardLedgerPath, "utf8");
   assert(scorecardLedgerAfter === scorecardFixture, "the scorecard path must not write to the ledger");
