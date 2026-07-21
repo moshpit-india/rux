@@ -1,9 +1,25 @@
 {
   "name": "@moshpits/rux",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": false,
   "license": "Apache-2.0",
-  "description": "Test-first run ledger for AI coding agents.",
+  "description": "Test-first run ledger for AI coding agents — record real Claude Code, Codex, and Gemini CLI runs, attach checks and verdicts, and route the next task on local evidence.",
+  "author": "Moshpit Labs",
+  "keywords": [
+    "ai",
+    "agents",
+    "coding-agent",
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "cli",
+    "developer-tools",
+    "run-ledger",
+    "evals",
+    "routing",
+    "orchestration",
+    "evidence"
+  ],
   "type": "module",
   "repository": {
     "type": "git",

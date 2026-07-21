@@ -1,16 +1,26 @@
 # Rux
 
-Rux is an open-source, test-first run ledger for AI coding agents. It records real local agent sessions first, then uses that evidence to recommend better runner and roster choices over time.
+[![npm version](https://img.shields.io/npm/v/%40moshpits%2Frux)](https://www.npmjs.com/package/@moshpits/rux)
+[![node](https://img.shields.io/node/v/%40moshpits%2Frux)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/%40moshpits%2Frux)](LICENSE)
 
-It helps a developer or team answer one practical question:
+Rux is an open-source, test-first run ledger for AI coding agents. It records what Claude Code, Codex, and Gemini CLI actually do in your repo — invocations, diffs, checks, verdicts — and turns that evidence into recommendations for the next run.
+
+One loop:
+
+```text
+plan -> run -> record -> review -> improve
+```
+
+One practical question, answered from your own repo's history:
 
 > For this repo and this task, which agent setup should we use, what happened, and what did we learn?
 
-It is not a model gateway. It does not proxy API calls, hide provider auth, or replace Claude Code, Codex, Gemini CLI, Cursor, Zed, VS Code, or other tools. It wraps the tools people already use, records what happened, and uses that evidence to recommend better runs over time.
+It is not a model gateway. Rux wraps the CLIs you already use, inherits their auth, and adds no telemetry. Your evidence stays in your repo.
 
-Rux also carries the local operating policy for agent spend discipline. The committed `rux.policy.json` file includes a `token_governor` block that tells agents when to cap tool output, when to create handoffs, and when expensive models, high effort, subagents, or review agents need a named reason and artifact.
+## Quickstart
 
-## Five-Minute Quickstart
+Requires Node 20+, git, and at least one provider CLI (`claude`, `codex`, or `gemini`) installed and authenticated.
 
 ```sh
 npm install -g @moshpits/rux
@@ -18,9 +28,7 @@ rux init
 rux status
 ```
 
-Rux uses the Claude, Codex, and Gemini CLIs already installed and authenticated on your machine. It does not store provider credentials.
-
-Try one recorded loop:
+Record one real loop:
 
 ```sh
 rux run "review the navigation code" --runner gemini
@@ -28,15 +36,27 @@ rux show <run-id>
 rux verdict <run-id> accepted --note "Useful review"
 ```
 
-When the current Codex/Claude/Gemini session already did the work, record it without starting a nested provider run:
+Already did the work in your current Claude/Codex/Gemini session? `rux record` captures it without spawning a nested provider run:
 
 ```sh
-rux record "implemented the stats filters in the current Codex session" --runner codex --check "npm test" --verdict accepted
+rux record "implemented the stats filters" --runner codex --check "npm test" --verdict accepted
 ```
 
-In an interactive terminal, Rux prints readable output. When stdout is piped or redirected, Rux keeps JSON for scripts. Use `--json` any time you want JSON explicitly.
+For long sessions, `rux record --start "<task>" --runner <cli>` snapshots a baseline first so the final record diffs cleanly.
 
-Example terminal output:
+Interactive terminals get readable output; pipes and scripts get JSON. `--json` forces JSON anywhere it is supported.
+
+## The Loop, By Command
+
+| Step | Commands |
+| --- | --- |
+| Decide | `rux suggest`, `rux plan`, `rux rank`, `rux policy` |
+| Capture | `rux run`, `rux record`, `rux import` |
+| Review | `rux ls`, `rux show`, `rux eval`, `rux outcome`, `rux status` |
+| Label | `rux check`, `rux verdict`, `rux mark` |
+| Share and ship | `rux export`, `rux propose`, `rux provider-smoke`, `rux release-check` |
+
+Example:
 
 ```text
 Rux plan
@@ -51,67 +71,49 @@ rux run 'fix the failing auth test' --runner codex --roster solo
 
 ## What Rux Records
 
-Rux keeps a repo-local evidence trail for AI coding work:
+Every run leaves a repo-local evidence trail under `.rux/`:
 
-- the task, runner, roster, provider mode, task kind, model, effort, and cost hints,
-- the provider invocation, transcript reference, output signal, status, and effective status,
-- repo state before and after, changed files, write-scope violations, and replay metadata,
-- inline checks, post-run checks, human verdicts, lifecycle marks, and feedback reports,
-- provider-smoke attempts for release readiness,
-- manual current-session records when the active agent already did the work.
+- task, runner, roster, provider mode, task kind, model, effort, and cost hints,
+- the provider invocation, transcript reference, output signal, and status,
+- repo state before and after, changed files, and write-scope violations,
+- checks, human verdicts, lifecycle marks, and feedback reports.
 
 That record powers `show`, `eval`, `outcome`, `status`, `export`, `rank`, `suggest`, `plan`, `propose`, and `report`.
 
 ## What Rux Recommends
 
-Rux recommends cautiously. `rank`, `suggest`, and `plan` use only eligible local evidence: checked or reviewed runs with enough provenance to be useful. Imported history, probe runs, provider-smoke runs, fake runs, failed safety runs, and vacuous checks do not quietly become routing proof.
+Rux recommends cautiously, from eligible local evidence only: checked or reviewed runs with real provenance. Imported history, probe runs, smoke runs, and vacuous checks never quietly become routing proof.
 
-Every recommendation carries an evidence maturity label:
+Every recommendation carries a maturity label — `none`, `thin`, `directional`, `strong`, or `mixed` — so you always know how much weight the advice deserves. When an agent session is already active, `rux suggest "<task>" --in-session claude|codex|gemini` weighs handoff cost instead of assuming a cold start.
 
-- `none`: no usable local evidence yet,
-- `thin`: useful for the next attempt, not a team standard,
-- `directional`: enough to prefer, still keep review,
-- `strong`: repeated positive local evidence,
-- `mixed`: enough history exists, but outcomes disagree.
+## Safety Defaults
+
+- Plan mode by default. Pass `--provider-mode write` when the provider should edit files.
+- Real provider runs refuse dirty worktrees. Commit, stash, or revert first, or pass `--allow-dirty` only when the dirty files are intentional context.
+- `--write-scope "path[,path...]"` declares where a provider may write. Out-of-scope edits are recorded as failed runs.
+- Provider output mirrors to stderr live, so questions and quiet long-running work stay visible; stdout stays clean for scripts.
+- No provider credentials stored, no API proxying, no telemetry, no silent self-modification.
+
+## Team Policy
+
+`rux.policy.json` is a committed, repo-local operating policy. It sets preferred runner order and roster defaults, and its `token_governor` block tells agents when to cap tool output, create session handoffs, and justify expensive models, high effort, or subagents. `rux policy` prints it; Rux-wrapped runs cap visible provider output while keeping full transcripts.
 
 ## What Rux Does Not Do
 
-Rux does not replace your coding agent, store provider credentials, proxy model API calls, run a SaaS backend, add telemetry by default, or silently modify its own source. It wraps the tools you already use, records what happened, and proposes improvements with evidence. Humans decide what to run and what to change.
+Rux does not replace your coding agent, store provider credentials, proxy model API calls, run a SaaS backend, or add telemetry. It wraps the tools you already use and proposes improvements with evidence. Humans decide what to run and what to change.
 
-## Why Now
+## Why Rux
 
-The space is not empty. Claude Code has dynamic workflows, AWS has CLI Agent Orchestrator, Zed has Agent Client Protocol, and the major coding agents are moving fast. The unsolved gap is not "how do I call a model?"
-
-The gap is local decision memory for coding work:
+Starting coding agents is easy now. Knowing which one to use, when extra agents are worth their cost, what failed last time, and what a team should standardize — that memory does not exist unless something keeps it. Rux keeps it:
 
 - which agent works best for which kind of task,
-- when extra agents are worth the cost,
-- which roster should be used before work starts,
-- what failed last time,
-- and what a team should standardize without losing developer choice.
+- when a roster beats a solo run,
+- what failed last time and why,
+- what to standardize without losing developer choice.
 
-That memory starts with capture. If the record is weak, routing is theater.
+That memory starts with capture. If the record is weak, routing is theater. Every run should make the next run smarter.
 
-## Useful Commands
-
-```sh
-rux runners
-rux policy
-rux plan "fix the failing auth test"
-rux run "review the navigation code" --runner gemini
-rux run "update the navigation code" --runner gemini --provider-mode write --check "npm run typecheck"
-rux run "update only the stats filters" --runner codex --provider-mode write --write-scope "lib/stats/filters.ts,test/stats-filters.test.ts" --check "npm test"
-rux record "implemented the stats filters in the current Codex session" --runner codex --check "npm test" --note "No nested provider run; current session did the work."
-rux report "Gemini surfaced a question but the terminal flow was unclear" --kind ux --command "rux run ..." --note "The question appeared in the transcript but was easy to miss."
-```
-
-Provider output and Rux progress are mirrored to stderr while the provider runs, so questions, start/finish state, checks, and quiet long-running work are visible in the terminal without corrupting script output. The default provider mode is `plan`; use `--provider-mode write` when you want the wrapped provider to edit files. Real provider runs refuse dirty worktrees by default; commit, stash, or revert existing changes first, or pass `--allow-dirty` only when those changes are intentionally part of the provider context. Use `--write-scope` to declare the files or directories a provider is allowed to change; Rux records out-of-scope edits as failed runs.
-
-Use `rux record` when the current agent session already did the work and you do not want to spawn a nested Claude/Codex/Gemini process just to satisfy the ledger. Manual records can help local recommendations when they have checks or verdicts, but they are down-weighted, labeled as manual evidence, and do not replace real provider-smoke or adapter-run evidence in the release gate. `--write-scope` applies to manual records too.
-
-Use `rux policy` before substantial agent work when you need the local operating contract. The current token-governor policy is advisory: agents should follow it, and Rux-wrapped provider runs cap visible provider output while keeping full output in the transcript. Rux does not yet interrupt live provider sessions or broker arbitrary shell output outside `rux run`.
-
-Start here:
+## Docs
 
 - [Vision](docs/VISION.md)
 - [State](docs/STATE.md)
@@ -119,7 +121,8 @@ Start here:
 - [v0 Plan](docs/V0_PLAN.md)
 - [Standards](docs/STANDARDS.md)
 - [Decisions](docs/DECISIONS.md)
+- [Changelog](CHANGELOG.md)
 
-## Naming
+## License
 
-Rux is the selected release name. Runtime identity is centralized in `src/identity.mjs` so future naming adjustments stay small. The release posture is test first, then publish. Avoid "AI gateway" unless discussing the market, because gateway implies proxying model calls and credentials.
+[Apache-2.0](LICENSE) © Moshpit Labs

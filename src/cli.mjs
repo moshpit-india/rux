@@ -167,34 +167,76 @@ async function main() {
 }
 
 function printHelp() {
-  console.log(`${PRODUCT_NAME}
+  console.log(`${PRODUCT_NAME} — test-first run ledger for AI coding agents
 
 Usage:
-  ${CLI_NAME} runners
+  ${CLI_NAME} <command> [options]
+
+Start:
   ${CLI_NAME} init [--cwd PATH] [--force]
-  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--stream] [--allow-dirty] [--json]
-  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--json]
-  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]] [--json]
-  ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
-  ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
-  ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
-  ${CLI_NAME} suggest "<task>" [--in-session claude|codex|gemini] [--include-probes] [--cwd PATH] [--json]
-  ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH] [--json]
-  ${CLI_NAME} status [--cwd PATH] [--json]
-  ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts] [--json]
-  ${CLI_NAME} policy [--cwd PATH]
+      Create rux.policy.json and ignore .rux/. No ledger writes, no provider calls.
+  ${CLI_NAME} runners
+      List runner adapters and which provider CLIs are installed.
   ${CLI_NAME} doctor [--cwd PATH]
-  ${CLI_NAME} release-check [--cwd PATH] [--strict]
-  ${CLI_NAME} propose [--cwd PATH]
-  ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--source-repo PATH] [--run-id ID | --record --runner claude|codex|gemini | --no-run "REASON"] [--command "COMMAND"] [--note "TEXT"] [--cwd PATH]
-  ${CLI_NAME} --version
+      Read-only readiness check: Node, git, ledger state, provider CLIs.
+  ${CLI_NAME} status [--cwd PATH] [--json]
+      Ledger health, evidence maturity, release blockers, next actions.
+
+Decide:
+  ${CLI_NAME} suggest "<task>" [--in-session claude|codex|gemini] [--include-probes] [--cwd PATH] [--json]
+      Recommend a runner from eligible local evidence, with a maturity label.
+  ${CLI_NAME} plan "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"]
+      Dry-run roster design. Prints a runnable command; never calls providers.
+  ${CLI_NAME} rank [--task-kind KIND] [--include-probes] [--cwd PATH] [--json]
+      Rank runners, models, efforts, and rosters from eligible evidence.
+  ${CLI_NAME} policy [--cwd PATH]
+      Print the committed repo policy, including the token governor.
+
+Capture:
+  ${CLI_NAME} run "<task>" [--runner fake|claude|codex|gemini] [--roster solo|pair|repair|plan-code-review] [--purpose task|probe] [--task-kind KIND] [--provider-mode plan|write] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH] [--check "COMMAND"] [--timeout-ms N] [--write-scope PATH[,PATH...]] [--stream] [--allow-dirty] [--json]
+      Run a task through a provider CLI and record everything.
+  ${CLI_NAME} record --start "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--json]
+      Snapshot a session baseline before the current agent starts work.
+  ${CLI_NAME} record "<task>" --runner claude|codex|gemini [--task-kind KIND] [--cwd PATH] [--check "COMMAND"] [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--write-scope PATH[,PATH...]] [--json]
+      Record work the current agent session already did. No nested provider run.
+  ${CLI_NAME} import --from PATH [--runner claude|codex|gemini|unknown] [--task "TEXT"] [--model NAME] [--effort LEVEL] [--cost-hint USD] [--cwd PATH]
+      Import an external transcript as low-confidence history.
+
+Inspect:
   ${CLI_NAME} ls [--cwd PATH]
+      List runs with status, outcome, and lifecycle marks.
   ${CLI_NAME} show <run-id> [--cwd PATH]
+      Full record for one run: checks, verdicts, reports, evaluation.
   ${CLI_NAME} eval <run-id> [--cwd PATH]
+      Explain routing eligibility and evidence quality for one run.
   ${CLI_NAME} outcome <run-id> [--cwd PATH]
+      Explain the outcome signal for one run.
+
+Label:
   ${CLI_NAME} check <run-id> --command "COMMAND" [--verdict accepted|rejected|partial|unknown] [--note "TEXT"] [--cwd PATH] [--json]
+      Append a post-run check result to an existing run.
   ${CLI_NAME} verdict <run-id> accepted|rejected|partial|unknown [--note "TEXT"] [--cwd PATH]
+      Attach a human verdict to a run.
   ${CLI_NAME} mark <run-id> reverted|replayed|accepted-downstream [--note "TEXT"] [--cwd PATH]
+      Record downstream lifecycle evidence.
+  ${CLI_NAME} report "<summary>" [--kind bug|ux|adapter|docs|routing|orchestration|install|idea|success|other] [--source-repo PATH] [--run-id ID | --record --runner claude|codex|gemini | --no-run "REASON"] [--command "COMMAND"] [--note "TEXT"] [--cwd PATH]
+      File local feedback linked to runs where possible.
+
+Share and ship:
+  ${CLI_NAME} export [--cwd PATH] [--limit N] [--run-id ID] [--include-transcripts] [--json]
+      Shareable JSON summaries. Transcripts only with --include-transcripts.
+  ${CLI_NAME} propose [--cwd PATH]
+      Write evidence-cited improvement proposals under .rux/proposals/.
+  ${CLI_NAME} provider-smoke --runner claude|codex|gemini [--model NAME] [--effort LEVEL] [--cwd PATH] [--timeout-ms N] [--allow-dirty]
+      Record release smoke evidence for a provider CLI. Not routing evidence.
+  ${CLI_NAME} release-check [--cwd PATH] [--strict]
+      Read-only publish gate. --strict exits non-zero while blockers remain.
+
+More:
+  ${CLI_NAME} help | --help | -h
+  ${CLI_NAME} --version
+
+Docs: https://github.com/Moshpit-Labs/rux#readme
 `);
 }
 
