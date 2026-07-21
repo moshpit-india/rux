@@ -4,7 +4,7 @@ Last updated: 2026-06-12
 
 ## One-Line Summary
 
-Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current published npm release is `@moshpits/rux@0.2.3`; `0.2.4` is prepared and pending publish (awaiting npm auth). The release posture is still test first: local verification before every publish.
+Rux is a public coding-agent run ledger that records real outcomes first, then uses that evidence to recommend agent rosters. The current published npm release is `@moshpits/rux@0.2.4`. The release posture is still test first: local verification before every publish.
 
 ## Decisions
 
@@ -15,7 +15,7 @@ Rux is a public coding-agent run ledger that records real outcomes first, then u
 - NPM org created: `moshpits` (`https://www.npmjs.com/org/moshpits`). Public package metadata lives under `@moshpits/rux`. The unscoped `rux` npm package is already occupied by an old, unrelated React/observable package; use the scoped package plus `rux` bin.
 - `@moshpits/rux@0.2.2` is the token-governor release. It keeps the `0.2.1` opt-in Claude `--stream` mode and adds advisory `token_governor` policy plus visible provider-output capping for Rux-wrapped provider runs while preserving full transcript output.
 - `@moshpits/rux@0.2.3` is the routing-quality release, published to npm with the `latest` dist-tag. It adds `rux suggest --in-session claude|codex|gemini` so suggest weighs handoff cost instead of assuming a cold start, matches query and evidence on the effective (changed-file corrected) task kind rather than mislabeled stored kinds, and observes provider model metadata from real provider usage maps. These are the first proof-quarter friction fixes addressing the day-6 finding that `suggest` recommended unwarranted handoffs.
-- `@moshpits/rux@0.2.4` is prepared and pending publish (npm auth needed). It is a packaging and developer-experience polish release with no runtime behavior change: README rewritten as a concise public entry surface (badges, requirements, loop-by-command table, safety defaults), `rux help` regrouped by loop step with one-line command descriptions, npm metadata enriched (keywords, author, sharper description), and a `CHANGELOG.md` added so release notes have a durable home. The lean npm allowlist is unchanged; CHANGELOG stays repo-only per the lean-package decision.
+- `@moshpits/rux@0.2.4` is published to npm. It is a packaging and developer-experience polish release with no runtime behavior change: README rewritten as a concise public entry surface (badges, requirements, loop-by-command table, safety defaults), `rux help` regrouped by loop step with one-line command descriptions, npm metadata enriched (keywords, author, sharper description), and a `CHANGELOG.md` added so release notes have a durable home. The lean npm allowlist is unchanged; CHANGELOG stays repo-only per the lean-package decision.
 - Package privacy has been deliberately removed for public release after local smoke, real provider smoke, and first routing-eligible provider task evidence passed.
 - Keep the npm package lean. The package allowlist includes runtime source and the default policy file; internal docs, tests, and agent instructions stay repo-only.
 - Local smoke now verifies the npm tarball contents, installs the packed tarball into a temporary prefix, and runs the installed `rux` bin.
