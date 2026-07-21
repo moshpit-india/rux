@@ -15,6 +15,31 @@ const REPORT_DIR = "reports";
 const POLICY_FILE = "rux.policy.json";
 const SCHEMA_VERSION = 2;
 const CLASSIFIER_VERSION = "read-classifier-2026-06-11";
+// Rux's own pre-registration window (docs/PROOF.md, 2026-06-12 -> 2026-09-12).
+// The scorecard defaults to this window and cites the pre-registered targets; it
+// never redefines them. --since/--until override the window for other repos.
+const PROOF_QUARTER = {
+  source: "docs/PROOF.md",
+  start: "2026-06-12",
+  end: "2026-09-12",
+  kill_checkpoint: "2026-08-01",
+  kill_checkpoint_min_decisions: 20,
+  standing_zero_targets: {
+    live_claude_task_runs_ok: 5,
+    lifecycle_marks: 5,
+    observed_model_share: 0.5,
+    new_run_verdict_coverage: 0.6
+  }
+};
+// Outcome labels that are definite negatives. Everything else that scores 0
+// (unlabeled, imported, provider-smoke, blocked) is unjudged, not a loss.
+const REGRET_OUTCOME_LABELS = new Set([
+  "human_rejected",
+  "checks_failed",
+  "run_failed",
+  "reverted_downstream"
+]);
+const ROUTING_DECISION_RUNNERS = ["claude", "codex", "gemini"];
 const rosterDefinitions = new Set(["solo", "pair", "repair", "plan-code-review"]);
 const lifecycleMarkDefinitions = new Set(["reverted", "replayed", "accepted-downstream"]);
 const verdictDefinitions = new Set(["accepted", "rejected", "partial", "unknown"]);
@@ -49,11 +74,14 @@ const knownOptionNames = new Set([
   "roster",
   "run-id",
   "runner",
+  "scorecard",
+  "since",
   "source-repo",
   "started-at",
   "start",
   "status",
   "strict",
+  "until",
   "stream",
   "task",
   "task-kind",
@@ -68,6 +96,7 @@ const booleanOptionNames = new Set([
   "include-probes",
   "json",
   "record",
+  "scorecard",
   "start",
   "strict",
   "stream"
@@ -181,6 +210,8 @@ Start:
       Read-only readiness check: Node, git, ledger state, provider CLIs.
   ${CLI_NAME} status [--cwd PATH] [--json]
       Ledger health, evidence maturity, release blockers, next actions.
+  ${CLI_NAME} status --scorecard [--since DATE] [--until DATE] [--cwd PATH] [--json]
+      Routing scorecard: adherence, divergence win-rate, regret cases, all citing run IDs.
 
 Decide:
   ${CLI_NAME} suggest "<task>" [--in-session claude|codex|gemini] [--include-probes] [--cwd PATH] [--json]
@@ -1188,6 +1219,9 @@ function packageScriptsHaveReleaseGuard(packageJson) {
 
 async function status(args) {
   const { options } = parseOptions(args);
+  if (options.scorecard === true) {
+    return statusScorecard(options);
+  }
   const cwd = resolveCwd(options);
   const events = await readLedger(cwd);
   const policy = await loadPolicy(cwd);
@@ -1323,6 +1357,563 @@ async function status(args) {
       "Provider-smoke evidence proves adapter readiness, not task quality."
     ]
   }, formatStatusHuman);
+}
+
+// The routing scorecard is the read-only proof-quarter instrument allowed by
+// docs/PROOF.md: it answers "is suggest changing routing decisions for the
+// better?" from stamped routing reports plus the checks, verdicts, and lifecycle
+// marks already on their linked runs. No provider calls, no ledger writes, no
+// LLM judges. It extends `status` instead of adding a top-level noun.
+async function statusScorecard(options) {
+  const cwd = resolveCwd(options);
+  const events = await readLedger(cwd);
+  emitResult(options, buildScorecard({ cwd, events, options }), formatScorecardHuman);
+}
+
+function buildScorecard({ cwd, events, options = {} }) {
+  const window = resolveScorecardWindow(options);
+  const runs = runsWithAppendedChecks(events);
+  const topRuns = topLevelRuns(runs);
+  const runsById = new Map(runs.map((run) => [run.id, run]));
+  const verdicts = latestVerdictByRun(events);
+  const marks = lifecycleMarksByRun(events);
+  const childrenByParent = new Map();
+  for (const run of runs) {
+    if (!run.parent_id) continue;
+    childrenByParent.set(run.parent_id, [...(childrenByParent.get(run.parent_id) ?? []), run]);
+  }
+
+  const routingReports = events.filter((event) => event.type === "report" && event.kind === "routing");
+  const inWindow = routingReports.filter((report) => withinScorecardWindow(report.created_at, window));
+  const outsideWindow = routingReports.filter((report) => !withinScorecardWindow(report.created_at, window));
+  const decisions = inWindow
+    .map((report) => buildRoutingDecision({ report, runsById, childrenByParent, verdicts, marks }))
+    .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+
+  const followed = decisions.filter((decision) => decision.adherence === "followed");
+  const overridden = decisions.filter((decision) => decision.adherence === "overridden");
+  const unclearAdherence = decisions.filter((decision) => decision.adherence === "unclear");
+  const divergenceFollowed = decisions.filter((decision) => decision.decision_class === "divergence_followed");
+  const divergenceOverridden = decisions.filter((decision) => decision.decision_class === "divergence_overridden");
+  const aligned = decisions.filter((decision) => decision.decision_class.startsWith("aligned"));
+  const unclassified = decisions.filter((decision) => decision.decision_class === "unclassified");
+  const restatements = divergenceOverridden.filter((decision) => decision.restatement === true);
+  const nonRestatements = divergenceOverridden.filter((decision) => decision.restatement !== true);
+  const instrumented = decisions.filter((decision) => decision.instrumented === true);
+
+  return {
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    view: "routing_scorecard",
+    schema_version: SCHEMA_VERSION,
+    generated_at: new Date().toISOString(),
+    cwd,
+    window,
+    bar: {
+      source: PROOF_QUARTER.source,
+      claim: "rux suggest changes real routing decisions for the better.",
+      divergence_definition:
+        "Per the 2026-06-19 PROOF.md amendment, a divergence is a case where suggest recommended a different runner than the in-session one. Overrides that merely restate \"continue where I already am\" are separated out.",
+      judged_by: "checks, human verdicts, and lifecycle marks only — no LLM judges",
+      kill_checkpoint: PROOF_QUARTER.kill_checkpoint
+    },
+    coverage: buildScorecardCoverage({ routingReports, inWindow, outsideWindow, decisions, instrumented }),
+    adherence: {
+      decisions: decisions.length,
+      followed: followed.length,
+      overridden: overridden.length,
+      unclear: unclearAdherence.length,
+      adherence_rate: rateOrNull(followed.length, followed.length + overridden.length),
+      followed_run_ids: citedRunIds(followed),
+      overridden_run_ids: citedRunIds(overridden),
+      unclear_report_ids: unclearAdherence.map((decision) => decision.report_id)
+    },
+    outcomes_by_adherence: {
+      followed: summarizeDecisionOutcomes(followed),
+      overridden: summarizeDecisionOutcomes(overridden)
+    },
+    divergence: {
+      test_set: summarizeDecisionOutcomes(divergenceFollowed),
+      overridden: {
+        ...summarizeDecisionOutcomes(divergenceOverridden),
+        restatements: restatements.length,
+        restatement_run_ids: citedRunIds(restatements),
+        non_restatements: nonRestatements.length,
+        non_restatement_outcomes: summarizeDecisionOutcomes(nonRestatements)
+      },
+      aligned: summarizeDecisionOutcomes(aligned),
+      unclassified: unclassified.map((decision) => ({
+        report_id: decision.report_id,
+        run_id: decision.run_id,
+        parse_gaps: decision.parse_gaps
+      })),
+      advantage: divergenceAdvantage(divergenceFollowed, nonRestatements),
+      assessment: divergenceAssessment(divergenceFollowed, divergenceOverridden, restatements)
+    },
+    regret: decisions
+      .filter((decision) => decision.judgment === "loss")
+      .map((decision) => ({
+        report_id: decision.report_id,
+        run_id: decision.run_id,
+        decision_class: decision.decision_class,
+        adherence: decision.adherence,
+        recommended_runner: decision.recommended_runner,
+        actual_runner: decision.actual_runner,
+        outcome: decision.outcome?.label ?? null,
+        outcome_reason: decision.outcome?.reason ?? null,
+        summary: decision.summary
+      })),
+    standing_zeros: buildStandingZeros({ topRuns, events, verdicts, marks, window }),
+    kill_check: buildKillCheck({ instrumented, divergenceFollowed, divergenceOverridden, restatements, window }),
+    decisions,
+    notes: [
+      "status --scorecard is read-only: no provider calls and no ledger writes.",
+      "Single-repo by design. PROOF.md quotas are cross-repo; this view counts only this repo's ledger, so tally other repos separately.",
+      "Recommendations are read from the stamped routing-report note, not recomputed — the evidence pool has grown since each decision was made.",
+      "A followed divergence is only visible when the note says a handoff was recommended; recommended and actual runner match once the handoff is taken. Unparseable notes are listed under divergence.unclassified rather than dropped.",
+      "Win-rate denominators exclude unjudged runs. Only human_rejected, checks_failed, run_failed, and reverted_downstream count as losses."
+    ]
+  };
+}
+
+function buildScorecardCoverage({ routingReports, inWindow, outsideWindow, decisions, instrumented }) {
+  const linked = decisions.filter((decision) => Boolean(decision.run_id));
+  const runFound = decisions.filter((decision) => decision.run_found === true);
+  const outcomeBearing = decisions.filter((decision) => decision.judgment !== "unjudged");
+  return {
+    routing_reports_total: routingReports.length,
+    routing_reports_in_window: inWindow.length,
+    routing_reports_outside_window: outsideWindow.length,
+    outside_window_report_ids: outsideWindow.map((report) => report.id),
+    instrumented_decisions: instrumented.length,
+    funnel: [
+      { stage: "routing_report_stamped", count: decisions.length, ids: decisions.map((decision) => decision.report_id) },
+      { stage: "linked_to_run", count: linked.length, ids: citedRunIds(linked) },
+      { stage: "linked_run_present_in_ledger", count: runFound.length, ids: citedRunIds(runFound) },
+      { stage: "check_verdict_or_mark_on_run", count: instrumented.length, ids: citedRunIds(instrumented) },
+      { stage: "outcome_judgeable", count: outcomeBearing.length, ids: citedRunIds(outcomeBearing) }
+    ]
+  };
+}
+
+// One decision = one stamped routing report plus whatever the ledger already
+// knows about its linked run. Everything the parser cannot read stays visible as
+// a parse gap instead of being guessed.
+function buildRoutingDecision({ report, runsById, childrenByParent, verdicts, marks }) {
+  const parsed = parseRoutingNote(report.note ?? "");
+  const run = report.run_id ? runsById.get(report.run_id) ?? null : null;
+  const actualRunner = run?.runner ?? null;
+  const runMarks = run ? marks.get(run.id) ?? [] : [];
+  const verdict = run ? verdicts.get(run.id) ?? null : null;
+  const outcome = run
+    ? summarizeOutcome(run, childrenByParent.get(run.id) ?? [], verdict, runMarks)
+    : null;
+  const inSession = resolveDecisionInSessionRunner({ parsed, actualRunner });
+  const divergence = classifyRoutingDivergence({ parsed, inSession });
+  const adherence = parsed.adherence;
+  const decisionClass = routingDecisionClass({ divergence, adherence });
+  const judged = judgeDecisionOutcome(outcome);
+  const parseGaps = [...parsed.parse_gaps];
+  if (report.run_id && !run) parseGaps.push("linked_run_missing_from_ledger");
+  if (!report.run_id) parseGaps.push("report_not_linked_to_run");
+  if (divergence === "unknown") parseGaps.push("divergence_not_determinable");
+
+  return {
+    report_id: report.id,
+    created_at: report.created_at,
+    summary: report.summary,
+    run_id: report.run_id ?? null,
+    run_found: report.run_id ? Boolean(run) : null,
+    task_kind: run ? effectiveTaskKind(run) : null,
+    recommended_runner: parsed.recommended_runner,
+    recommended_roster: parsed.recommended_roster,
+    maturity: parsed.maturity,
+    in_session_runner: inSession.runner,
+    in_session_source: inSession.source,
+    actual_runner: actualRunner,
+    adherence,
+    divergence,
+    decision_class: decisionClass,
+    restatement: decisionClass === "divergence_overridden" ? parsed.restatement : null,
+    outcome: outcome
+      ? { label: outcome.label, score: outcome.score, source: outcome.source, reason: outcome.reason }
+      : null,
+    judgment: judged.judgment,
+    judgment_reason: judged.reason,
+    instrumented: Boolean(run) && (
+      (Array.isArray(run.checks) && run.checks.length > 0) || Boolean(verdict) || runMarks.length > 0
+    ),
+    note: report.note ?? "",
+    parse_gaps: unique(parseGaps)
+  };
+}
+
+// PROOF.md protocol step 1 makes the stamped note the decision-time record, so it
+// is the source of truth here. Re-deriving the recommendation with
+// buildRecommendation would answer with today's evidence pool, not the pool the
+// operator actually saw.
+function parseRoutingNote(note = "") {
+  const text = String(note);
+  const lower = text.toLowerCase();
+  const gaps = [];
+
+  const recommendedRunner = runnerNamedAfterRecommendation(lower);
+  if (!recommendedRunner) gaps.push("recommended_runner_not_parsed");
+  const rosterMatch = lower.match(/\b(plan-code-review|repair|solo|pair)\b/);
+  const maturityMatch = lower.match(/maturity[:\s/]*\b(none|thin|directional|strong|mixed)\b/)
+    ?? lower.match(/\b(none|thin|directional|strong|mixed)\s+(?:local\s+)?evidence\b/)
+    ?? lower.match(/\bwith\s+(none|thin|directional|strong|mixed)\b/);
+  if (!maturityMatch) gaps.push("maturity_not_parsed");
+
+  const overrideSignal = /\boverrid(?:den|e|ing)\b|\boverrode\b|\b(?:not|never|didn'?t|did not)\s+follow(?:ed)?\b/.test(lower);
+  const followSignal = /\bfollow(?:ed|ing|s)?\b/.test(lower);
+  const adherence = overrideSignal ? "overridden" : followSignal ? "followed" : "unclear";
+  if (adherence === "unclear") gaps.push("adherence_not_parsed");
+
+  return {
+    recommended_runner: recommendedRunner,
+    recommended_roster: rosterMatch ? rosterMatch[1] : null,
+    maturity: maturityMatch ? maturityMatch[1] : null,
+    adherence,
+    // Only phrases anchored to what suggest recommended count here. "stayed
+    // in-session" describes the operator's choice, not the recommendation.
+    recommended_skip: /handoff\s*=\s*skip|recommend(?:ed|s)?\s+continue[- ]in[- ]session|recommend(?:ed|s)?\s+(?:to\s+)?continue\s+in/.test(lower),
+    recommended_handoff: /handoff\s*=\s*recommended|recommend(?:ed|s)?\s+(?:a\s+)?hand(?:ing)?[- ]?off|recommend(?:ed|s)?\s+hand(?:ing)?\s+off\s+to/.test(lower),
+    in_session_runner: runnerNamedAsSession(lower),
+    in_session_execution: /current session|in[- ]session|executed inline|via rux record|nested provider/.test(lower),
+    // The amendment's "not interesting" class: an override whose reason is simply
+    // that a capable session already held the context.
+    restatement: /already\s+(?:had|has|held|holds)[^.;]{0,80}context/.test(lower)
+      || /handoff\s+cost/.test(lower)
+      || /no\s+(?:external\s+)?(?:provider\s+)?handoff\s+(?:was\s+)?(?:warranted|justified|needed|required)/.test(lower)
+      || /handoff[^.;]{0,40}(?:unjustified|unwarranted|not\s+warranted|not\s+justified)/.test(lower),
+    parse_gaps: gaps
+  };
+}
+
+// Take the runner named *earliest* after "recommended", not the first name in
+// runner order: notes routinely mention the in-session runner later in the same
+// sentence ("recommended codex/solo ... the current Claude session").
+function runnerNamedAfterRecommendation(lower) {
+  const anchor = /recommend(?:ed|s|ation)?/g;
+  let match;
+  while ((match = anchor.exec(lower)) !== null) {
+    const segment = lower.slice(match.index, match.index + 100);
+    let best = null;
+    for (const name of ROUTING_DECISION_RUNNERS) {
+      const index = segment.indexOf(name);
+      if (index >= 0 && (!best || index < best.index)) best = { name, index };
+    }
+    if (best) return best.name;
+  }
+  return null;
+}
+
+function runnerNamedAsSession(lower) {
+  const patterns = [
+    /in[- ]session\s+(?:as\s+)?(?:runner\s+)?(claude|codex|gemini)/,
+    /current\s+(claude|codex|gemini)\s+session/,
+    /(?:asking|current)\s+(claude|codex|gemini)\b/,
+    /(claude|codex|gemini)\s+session\b/
+  ];
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+function resolveDecisionInSessionRunner({ parsed, actualRunner }) {
+  if (parsed.in_session_runner) {
+    return { runner: parsed.in_session_runner, source: "note" };
+  }
+  // An override means the operator kept doing the work themselves, so the linked
+  // run's runner is the session that was already active.
+  if (parsed.adherence === "overridden" && actualRunner) {
+    return { runner: actualRunner, source: "linked_run_after_override" };
+  }
+  // A followed recommendation that the note says was executed in the current
+  // session names its own in-session runner: the run's runner. Require the
+  // recommendation to match the run, so a genuine handoff never lands here.
+  if (
+    parsed.adherence === "followed"
+    && parsed.in_session_execution
+    && actualRunner
+    && parsed.recommended_runner === actualRunner
+  ) {
+    return { runner: actualRunner, source: "linked_run_in_session_execution" };
+  }
+  return { runner: null, source: "unknown" };
+}
+
+// The one discriminating question: did suggest recommend handing off to a runner
+// different from the one already in session?
+function classifyRoutingDivergence({ parsed, inSession }) {
+  if (parsed.recommended_runner && inSession.runner) {
+    return parsed.recommended_runner === inSession.runner ? "aligned" : "diverged";
+  }
+  if (parsed.recommended_skip) return "aligned";
+  if (parsed.recommended_handoff) return "diverged";
+  return "unknown";
+}
+
+function routingDecisionClass({ divergence, adherence }) {
+  if (divergence === "diverged" && adherence === "followed") return "divergence_followed";
+  if (divergence === "diverged" && adherence === "overridden") return "divergence_overridden";
+  if (divergence === "aligned" && adherence === "followed") return "aligned_followed";
+  if (divergence === "aligned" && adherence === "overridden") return "aligned_overridden";
+  return "unclassified";
+}
+
+function judgeDecisionOutcome(outcome) {
+  if (!outcome) {
+    return { judgment: "unjudged", reason: "No linked run in this ledger." };
+  }
+  if (REGRET_OUTCOME_LABELS.has(outcome.label)) {
+    return { judgment: "loss", reason: outcome.reason };
+  }
+  if (outcome.score > 0) {
+    return { judgment: "win", reason: outcome.reason };
+  }
+  return { judgment: "unjudged", reason: `Outcome ${outcome.label} carries no win/loss signal.` };
+}
+
+function summarizeDecisionOutcomes(decisions) {
+  const wins = decisions.filter((decision) => decision.judgment === "win");
+  const losses = decisions.filter((decision) => decision.judgment === "loss");
+  const unjudged = decisions.filter((decision) => decision.judgment === "unjudged");
+  const partial = decisions.filter((decision) => decision.outcome?.label === "human_partial");
+  return {
+    size: decisions.length,
+    wins: wins.length,
+    losses: losses.length,
+    partial: partial.length,
+    unjudged: unjudged.length,
+    judged: wins.length + losses.length,
+    win_rate: rateOrNull(wins.length, wins.length + losses.length),
+    run_ids: citedRunIds(decisions),
+    win_run_ids: citedRunIds(wins),
+    loss_run_ids: citedRunIds(losses),
+    unjudged_run_ids: citedRunIds(unjudged)
+  };
+}
+
+// The kill criterion compares divergences against overrides. Restatement
+// overrides ("I stayed because I was already here") are excluded from the
+// comparison per the amendment, or they would dominate it.
+function divergenceAdvantage(divergenceFollowed, nonRestatementOverrides) {
+  const divergence = summarizeDecisionOutcomes(divergenceFollowed);
+  const override = summarizeDecisionOutcomes(nonRestatementOverrides);
+  if (divergence.win_rate === null || override.win_rate === null) {
+    return {
+      comparable: false,
+      divergence_win_rate: divergence.win_rate,
+      override_win_rate: override.win_rate,
+      delta: null,
+      reason: "Not enough judged decisions on both sides to compare win rates."
+    };
+  }
+  return {
+    comparable: true,
+    divergence_win_rate: divergence.win_rate,
+    override_win_rate: override.win_rate,
+    delta: Number((divergence.win_rate - override.win_rate).toFixed(4)),
+    reason: `Judged on ${divergence.judged} divergence(s) vs ${override.judged} non-restatement override(s).`
+  };
+}
+
+function divergenceAssessment(divergenceFollowed, divergenceOverridden, restatements) {
+  if (divergenceFollowed.length === 0 && divergenceOverridden.length === 0) {
+    return "No divergences recorded in this window: every parsed decision had suggest agreeing with the in-session runner. The test set is empty here.";
+  }
+  if (divergenceFollowed.length === 0) {
+    return `suggest diverged ${divergenceOverridden.length} time(s) and was overridden every time (${restatements.length} of those were plain continue-in-session restatements, which the 2026-06-19 amendment excludes from the signal). No followed divergence exists to judge yet.`;
+  }
+  if (divergenceFollowed.length < 3) {
+    return `Test set too thin to judge: ${divergenceFollowed.length} followed divergence(s). Read the itemized decisions, not the percentage.`;
+  }
+  return `${divergenceFollowed.length} followed divergence(s) available to judge. Percentages remain small-n; cite the run IDs.`;
+}
+
+function buildKillCheck({ instrumented, divergenceFollowed, divergenceOverridden, restatements, window }) {
+  const diverged = divergenceFollowed.length + divergenceOverridden.length;
+  const enoughDecisions = instrumented.length >= PROOF_QUARTER.kill_checkpoint_min_decisions;
+  return {
+    checkpoint: PROOF_QUARTER.kill_checkpoint,
+    source: PROOF_QUARTER.source,
+    inputs: {
+      instrumented_decisions: instrumented.length,
+      min_decisions_required: PROOF_QUARTER.kill_checkpoint_min_decisions,
+      minimum_met_in_this_repo: enoughDecisions,
+      divergences_recorded: diverged,
+      followed_divergences: divergenceFollowed.length,
+      overridden_divergences: divergenceOverridden.length,
+      restatement_overrides: restatements.length
+    },
+    ready_to_judge: enoughDecisions && divergenceFollowed.length > 0,
+    guidance: enoughDecisions
+      ? "Both kill-criterion inputs are present in this repo; a human reads the itemized decisions and decides."
+      : `This repo alone has fewer than ${PROOF_QUARTER.kill_checkpoint_min_decisions} instrumented decisions in ${window.start}..${window.end}. The quota is cross-repo; tally the other repos before judging.`,
+    note: "This view reports the kill-criterion inputs. It never declares the null result — that is a human call recorded in docs/STATE.md."
+  };
+}
+
+function buildStandingZeros({ topRuns, events, verdicts, marks, window }) {
+  const targets = PROOF_QUARTER.standing_zero_targets;
+  const liveClaudeOk = topRuns.filter((run) =>
+    run.runner === "claude"
+    && isLiveProviderTaskRun(run)
+    && readClassification(run).status === "ok");
+  const markEvents = events.filter((event) => event.type === "mark");
+  const newLiveRuns = topRuns.filter((run) =>
+    isLiveProviderTaskRun(run) && withinScorecardWindow(runTimestamp(run), window));
+  const observed = newLiveRuns.filter((run) => run.adapter?.metadata_sources?.model === "observed");
+  const withVerdict = newLiveRuns.filter((run) => verdicts.has(run.id));
+  const observedShare = rateOrNull(observed.length, newLiveRuns.length);
+  const verdictShare = rateOrNull(withVerdict.length, newLiveRuns.length);
+
+  return [
+    {
+      name: "live_claude_task_runs_ok",
+      target: `>= ${targets.live_claude_task_runs_ok} completed live Claude task runs`,
+      value: liveClaudeOk.length,
+      met: liveClaudeOk.length >= targets.live_claude_task_runs_ok,
+      windowed: false,
+      run_ids: liveClaudeOk.map((run) => run.id)
+    },
+    {
+      name: "lifecycle_marks",
+      target: `>= ${targets.lifecycle_marks} real lifecycle marks`,
+      value: markEvents.length,
+      met: markEvents.length >= targets.lifecycle_marks,
+      windowed: false,
+      run_ids: unique(markEvents.map((event) => event.run_id).filter(Boolean))
+    },
+    {
+      name: "observed_model_metadata_share",
+      target: "provider-observed model metadata on the majority of new live runs",
+      value: observedShare,
+      detail: { observed: observed.length, new_live_runs: newLiveRuns.length },
+      met: observedShare !== null && observedShare > targets.observed_model_share,
+      windowed: true,
+      run_ids: observed.map((run) => run.id),
+      missing_run_ids: newLiveRuns.filter((run) => !observed.includes(run)).map((run) => run.id)
+    },
+    {
+      name: "new_run_verdict_coverage",
+      target: ">= 60% verdict coverage on new live runs",
+      value: verdictShare,
+      detail: { with_verdict: withVerdict.length, new_live_runs: newLiveRuns.length },
+      met: verdictShare !== null && verdictShare >= targets.new_run_verdict_coverage,
+      windowed: true,
+      run_ids: withVerdict.map((run) => run.id),
+      missing_run_ids: newLiveRuns.filter((run) => !withVerdict.includes(run)).map((run) => run.id)
+    }
+  ];
+}
+
+function resolveScorecardWindow(options) {
+  const since = scorecardWindowOption(options.since, "--since", PROOF_QUARTER.start, false);
+  const until = scorecardWindowOption(options.until, "--until", PROOF_QUARTER.end, true);
+  if (since.ms > until.ms) {
+    throw new Error(`--since ${since.date} is after --until ${until.date}.`);
+  }
+  return {
+    start: since.date,
+    end: until.date,
+    start_ms: since.ms,
+    end_ms: until.ms,
+    source: since.source === "option" || until.source === "option"
+      ? "option"
+      : `${PROOF_QUARTER.source} pre-registered window`
+  };
+}
+
+function scorecardWindowOption(value, flag, fallback, endOfDay) {
+  if (value === true) {
+    throw new Error(`${flag} needs a date, for example: ${flag} ${fallback}`);
+  }
+  const raw = normalizeOptionalString(value);
+  const date = raw ?? fallback;
+  const iso = /^\d{4}-\d{2}-\d{2}$/.test(date)
+    ? `${date}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`
+    : date;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) {
+    throw new Error(`${flag} needs a date like ${fallback}. Received: ${date}`);
+  }
+  return { date, ms, source: raw ? "option" : "default" };
+}
+
+function withinScorecardWindow(timestamp, window) {
+  if (!timestamp) return false;
+  const ms = typeof timestamp === "number" ? timestamp : Date.parse(timestamp);
+  if (!Number.isFinite(ms)) return false;
+  return ms >= window.start_ms && ms <= window.end_ms;
+}
+
+function citedRunIds(decisions) {
+  return decisions.map((decision) => decision.run_id ?? `(unlinked ${decision.report_id})`);
+}
+
+function rateOrNull(part, total) {
+  if (!total) return null;
+  return Number((part / total).toFixed(4));
+}
+
+function formatPercent(rate) {
+  return rate === null || rate === undefined ? "n/a" : `${Math.round(rate * 100)}%`;
+}
+
+function formatScorecardHuman(scorecard) {
+  const divergence = scorecard.divergence;
+  const lines = [
+    `${PRODUCT_NAME} routing scorecard`,
+    `Repo: ${scorecard.cwd}`,
+    `Window: ${scorecard.window.start} .. ${scorecard.window.end} (${scorecard.window.source})`,
+    `Decisions: ${scorecard.adherence.decisions} stamped, ${scorecard.coverage.instrumented_decisions} instrumented (report + linked run + check/verdict/mark)`,
+    `Adherence: ${formatPercent(scorecard.adherence.adherence_rate)} (${scorecard.adherence.followed} followed / ${scorecard.adherence.overridden} overridden / ${scorecard.adherence.unclear} unclear)`
+  ];
+
+  lines.push("", "Divergence test set (suggest recommended a different runner than the in-session one)");
+  lines.push(`- followed divergences: n=${divergence.test_set.size}, win-rate ${formatPercent(divergence.test_set.win_rate)} (${divergence.test_set.wins}W/${divergence.test_set.losses}L, ${divergence.test_set.unjudged} unjudged)`);
+  lines.push(`- overridden divergences: n=${divergence.overridden.size}, of which ${divergence.overridden.restatements} plain continue-in-session restatement(s) excluded from the signal`);
+  lines.push(`- non-restatement overrides: n=${divergence.overridden.non_restatements}, win-rate ${formatPercent(divergence.overridden.non_restatement_outcomes.win_rate)}`);
+  lines.push(`- aligned decisions: n=${divergence.aligned.size}, win-rate ${formatPercent(divergence.aligned.win_rate)}`);
+  if (divergence.unclassified.length > 0) {
+    lines.push(`- unclassified: n=${divergence.unclassified.length} (${divergence.unclassified.map((item) => item.run_id ?? item.report_id).join(", ")})`);
+  }
+  lines.push(`- assessment: ${divergence.assessment}`);
+
+  lines.push("", "Decisions");
+  for (const decision of scorecard.decisions) {
+    lines.push(`- ${decision.run_id ?? decision.report_id} ${decision.decision_class} [${decision.adherence}] rec=${decision.recommended_runner ?? "?"}${decision.recommended_roster ? `/${decision.recommended_roster}` : ""} in-session=${decision.in_session_runner ?? "?"} maturity=${decision.maturity ?? "?"} outcome=${decision.outcome?.label ?? "none"} -> ${decision.judgment}`);
+  }
+
+  if (scorecard.regret.length > 0) {
+    lines.push("", "Regret cases");
+    lines.push(...scorecard.regret.map((item) => `- ${item.run_id}: ${item.decision_class} (${item.adherence}), outcome ${item.outcome} — ${item.summary}`));
+  } else {
+    lines.push("", "Regret cases: none in this window.");
+  }
+
+  lines.push("", "Standing zeros");
+  for (const zero of scorecard.standing_zeros) {
+    const value = zero.detail
+      ? `${formatPercent(zero.value)} (${zero.detail.observed ?? zero.detail.with_verdict}/${zero.detail.new_live_runs})`
+      : String(zero.value);
+    lines.push(`- ${zero.name}: ${value} — target ${zero.target} — ${zero.met ? "met" : "not met"}`);
+    if (zero.run_ids.length > 0) {
+      lines.push(`  runs: ${zero.run_ids.slice(0, 6).join(", ")}${zero.run_ids.length > 6 ? ` (+${zero.run_ids.length - 6} more)` : ""}`);
+    }
+  }
+
+  lines.push("", `Kill checkpoint ${scorecard.kill_check.checkpoint}: ${scorecard.kill_check.ready_to_judge ? "inputs present" : "not judgeable from this repo alone"}`);
+  lines.push(`- ${scorecard.kill_check.guidance}`);
+
+  lines.push("", "Notes");
+  lines.push(...scorecard.notes.map((note) => `- ${note}`));
+  return lines.join("\n");
 }
 
 async function showPolicy(args) {

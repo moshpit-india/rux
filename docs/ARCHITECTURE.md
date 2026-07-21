@@ -277,6 +277,8 @@ In v0, `--model`, `--effort`, and `--cost-hint` are run metadata. Rux records th
 
 `rux status` is the creator/team overview. It combines ledger counts, outcome label distribution, recommendation evidence maturity, provider-smoke readiness, release blockers, recent runs, and next actions without calling providers or writing files. When it suggests the next capture command, it also says whether that command would call a provider, write ledger evidence, and need human review.
 
+`rux status --scorecard` is the routing scorecard: the same read-only surface scoped to routing decisions. It reads stamped `--kind routing` reports as the decision-time record and joins them to the checks, verdicts, and lifecycle marks already on their linked runs. It reports adherence rate, followed-versus-overridden outcomes, the divergence test set (cases where `suggest` named a different runner than the in-session one), regret cases, and standing-zero progress, with run IDs on every figure. It parses the stamped note rather than recomputing the recommendation, because the evidence pool has grown since each decision was made; notes it cannot read stay visible as `unclassified` with their parse gaps. Win-rate denominators exclude unjudged runs, and only `human_rejected`, `checks_failed`, `run_failed`, and `reverted_downstream` count as losses. There are no LLM judges anywhere in this path. It is single-repo by design and reports kill-criterion inputs without ever declaring a result.
+
 ## Cold Start
 
 Repo-local capture means the tool begins with little data. That is a product constraint, not an implementation detail. It keeps the first record trustworthy without making the product local-only.

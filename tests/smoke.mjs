@@ -42,6 +42,7 @@ try {
   assert(helpRun.stdout.includes("--allow-dirty"), "--help should include dirty worktree override");
   assert(helpRun.stdout.includes("--write-scope"), "--help should include write-scope guard");
   assert(helpRun.stdout.includes("rux release-check [--cwd PATH] [--strict]"), "--help should include strict release-check flag");
+  assert(helpRun.stdout.includes("rux status --scorecard"), "--help should include the routing scorecard view");
   const shortHelpRun = run("node", [cliPath, "-h"]);
   assert(shortHelpRun.stdout.includes("Usage:"), "-h should print usage");
   const versionRun = run("node", [cliPath, "--version"]);
@@ -504,6 +505,101 @@ try {
   const unspecifiedQuery = JSON.parse(run("node", [cliPath, "suggest", "update the readme docs", "--cwd", effectiveKindRoot]).stdout);
   assert(unspecifiedQuery.task_kind === "unspecified" && unspecifiedQuery.task_kind_source === "unspecified", "suggest without --task-kind should report an unspecified, non-fabricated query kind");
   assert(unspecifiedQuery.recommendation.reason.includes("unspecified"), "unspecified suggest should say it is using all eligible history");
+
+  // The routing scorecard reads stamped routing reports plus the checks, verdicts,
+  // and marks already on their linked runs. The fixture ledger carries one of each
+  // interesting path, because the real ledger does not contain them all.
+  const scorecardRoot = join(tempRoot, "routing-scorecard");
+  await mkdir(join(scorecardRoot, ".rux", "ledger"), { recursive: true });
+  const scorecardLedgerPath = join(scorecardRoot, ".rux", "ledger", "2026-06-20.jsonl");
+  const scorecardFixture = await readFile(join(repoRoot, "tests", "fixtures", "routing-scorecard.jsonl"), "utf8");
+  await writeFile(scorecardLedgerPath, scorecardFixture, "utf8");
+  const scorecard = JSON.parse(run("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot]).stdout);
+
+  assert(scorecard.view === "routing_scorecard", "status --scorecard should emit the routing scorecard view");
+  assert(scorecard.window.start === "2026-06-12" && scorecard.window.end === "2026-09-12", "scorecard should default to the PROOF.md pre-registered window");
+  assert(scorecard.coverage.routing_reports_total === 8, "scorecard should count every routing report in the ledger");
+  assert(scorecard.coverage.routing_reports_outside_window === 1, "scorecard should keep out-of-window routing reports visible instead of dropping them");
+  assert(scorecard.adherence.decisions === 7, "scorecard should score only in-window routing decisions");
+  assert(scorecard.adherence.followed === 4 && scorecard.adherence.overridden === 2 && scorecard.adherence.unclear === 1, "scorecard adherence should split followed, overridden, and unparseable notes");
+  assert(scorecard.adherence.adherence_rate === 0.6667, "scorecard adherence rate should exclude unparseable notes from the denominator");
+
+  const decisionById = new Map(scorecard.decisions.map((decision) => [decision.run_id ?? decision.report_id, decision]));
+  const followedDivergence = decisionById.get("20260620T090000Z-d1000001");
+  assert(followedDivergence.decision_class === "divergence_followed", "a recommended handoff away from the in-session runner that was taken is a followed divergence");
+  assert(followedDivergence.recommended_runner === "codex" && followedDivergence.in_session_runner === "claude", "note parsing should read the recommended runner nearest the recommendation, not the session runner named later");
+  assert(followedDivergence.judgment === "win", "an accepted followed divergence should count as a win");
+  const regretDivergence = decisionById.get("20260621T090000Z-d2000002");
+  assert(regretDivergence.decision_class === "divergence_followed" && regretDivergence.judgment === "loss", "a followed divergence whose checks failed should count as a loss");
+  const restatement = decisionById.get("20260622T090000Z-d3000003");
+  assert(restatement.decision_class === "divergence_overridden" && restatement.restatement === true, "a continue-in-session override should be flagged as a restatement");
+  const nonRestatement = decisionById.get("20260623T090000Z-d4000004");
+  assert(nonRestatement.decision_class === "divergence_overridden" && nonRestatement.restatement === false, "an override with a substantive reason should not be flagged as a restatement");
+  assert(nonRestatement.in_session_runner === "claude" && nonRestatement.in_session_source === "linked_run_after_override", "an override should take the in-session runner from the run the operator kept doing");
+  const alignedDecision = decisionById.get("20260624T090000Z-d5000005");
+  assert(alignedDecision.decision_class === "aligned_followed", "a continue-in-session recommendation that was followed is aligned, not a divergence");
+  const unparseable = decisionById.get("20260625T090000Z-d6000006");
+  assert(unparseable.decision_class === "unclassified", "a note with no recommendation or adherence wording must stay unclassified");
+  assert(unparseable.parse_gaps.includes("recommended_runner_not_parsed") && unparseable.parse_gaps.includes("adherence_not_parsed"), "unclassified decisions should say what could not be parsed");
+  const missingRun = decisionById.get("20260626T090000Z-missingrun");
+  assert(missingRun.run_found === false && missingRun.judgment === "unjudged", "a routing report pointing at a missing run should be unjudged, not a win");
+  assert(missingRun.parse_gaps.includes("linked_run_missing_from_ledger"), "a missing linked run should surface as a parse gap");
+
+  assert(scorecard.divergence.test_set.size === 2, "the divergence test set should hold only followed divergences");
+  assert(scorecard.divergence.test_set.win_rate === 0.5, "divergence win-rate should be judged on wins and losses only");
+  assert(scorecard.divergence.test_set.run_ids.length === 2, "every divergence figure should cite run IDs");
+  assert(scorecard.divergence.overridden.restatements === 1 && scorecard.divergence.overridden.non_restatements === 1, "overridden divergences should separate restatements from substantive overrides");
+  assert(scorecard.divergence.overridden.non_restatement_outcomes.win_rate === 0, "the override comparison should use non-restatement overrides only");
+  assert(scorecard.divergence.advantage.comparable === true && scorecard.divergence.advantage.delta === 0.5, "the kill-check comparison should report the divergence advantage over non-restatement overrides");
+  assert(scorecard.divergence.unclassified.length === 2, "unclassified decisions should be listed, never silently dropped");
+  assert(scorecard.divergence.assessment.includes("too thin"), "a two-decision test set should be labeled too thin to judge");
+
+  assert(scorecard.regret.length === 2, "regret should list every decision whose linked run went badly");
+  assert(scorecard.regret.every((item) => item.run_id), "every regret case should cite a run ID");
+  assert(scorecard.regret.some((item) => item.outcome === "checks_failed") && scorecard.regret.some((item) => item.outcome === "human_rejected"), "regret should cover failed checks and rejected verdicts");
+
+  const zeros = new Map(scorecard.standing_zeros.map((zero) => [zero.name, zero]));
+  assert(zeros.get("live_claude_task_runs_ok").value === 1 && zeros.get("live_claude_task_runs_ok").met === false, "standing zeros should count completed live Claude task runs");
+  assert(zeros.get("live_claude_task_runs_ok").run_ids.includes("20260620T100000Z-live0001"), "the live Claude standing zero should cite its run IDs");
+  assert(zeros.get("lifecycle_marks").value === 1, "standing zeros should count lifecycle marks");
+  assert(zeros.get("observed_model_metadata_share").value === 0.3333 && zeros.get("observed_model_metadata_share").met === false, "observed model metadata share should be a minority in the fixture");
+  assert(zeros.get("new_run_verdict_coverage").value === 0.6667 && zeros.get("new_run_verdict_coverage").met === true, "verdict coverage at or above 60% should be met");
+  assert(zeros.get("new_run_verdict_coverage").missing_run_ids.includes("20260621T090000Z-d2000002"), "verdict coverage should name the runs still missing a verdict");
+
+  assert(scorecard.kill_check.ready_to_judge === false, "the kill check should not claim judgeability from a seven-decision single-repo ledger");
+  assert(scorecard.kill_check.note.includes("never declares"), "the kill check should leave the null-result call to a human");
+
+  const narrowedScorecard = JSON.parse(run("node", [
+    cliPath,
+    "status",
+    "--scorecard",
+    "--cwd",
+    scorecardRoot,
+    "--since",
+    "2026-06-22",
+    "--until",
+    "2026-06-24"
+  ]).stdout);
+  assert(narrowedScorecard.adherence.decisions === 3, "--since/--until should narrow the scored decisions");
+  assert(narrowedScorecard.window.source === "option", "an explicit window should say it came from options, not the pre-registration");
+
+  const missingSinceValue = spawnSync("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot, "--since"], { encoding: "utf8" });
+  assert(missingSinceValue.status !== 0, "--since without a date should fail");
+  assert(missingSinceValue.stderr.includes("--since needs a date"), "--since without a date should say what it needs");
+
+  const scorecardTty = spawnSync("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot], {
+    encoding: "utf8",
+    env: { ...process.env, RUX_FORCE_TTY: "1" }
+  });
+  assert(scorecardTty.status === 0, "forced TTY scorecard should complete");
+  assert(!isJsonOutput(scorecardTty.stdout), "forced TTY scorecard should print human-readable output");
+  assert(scorecardTty.stdout.includes("Rux routing scorecard"), "human scorecard should name the surface");
+  assert(scorecardTty.stdout.includes("20260621T090000Z-d2000002"), "human scorecard should cite run IDs inline");
+  assert(scorecardTty.stdout.includes("Regret cases"), "human scorecard should show regret cases");
+
+  const scorecardLedgerAfter = await readFile(scorecardLedgerPath, "utf8");
+  assert(scorecardLedgerAfter === scorecardFixture, "the scorecard path must not write to the ledger");
+  assert(!existsSync(join(scorecardRoot, ".rux", "reports")), "the scorecard path must not create report files");
 
   const runResult = run("node", [
     cliPath,

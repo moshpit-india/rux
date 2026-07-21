@@ -52,7 +52,7 @@ Interactive terminals get readable output; pipes and scripts get JSON. `--json` 
 | --- | --- |
 | Decide | `rux suggest`, `rux plan`, `rux rank`, `rux policy` |
 | Capture | `rux run`, `rux record`, `rux import` |
-| Review | `rux ls`, `rux show`, `rux eval`, `rux outcome`, `rux status` |
+| Review | `rux ls`, `rux show`, `rux eval`, `rux outcome`, `rux status`, `rux status --scorecard` |
 | Label | `rux check`, `rux verdict`, `rux mark` |
 | Share and ship | `rux export`, `rux propose`, `rux provider-smoke`, `rux release-check` |
 
