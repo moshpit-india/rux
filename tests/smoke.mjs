@@ -608,9 +608,52 @@ try {
   assert(scorecardTty.stdout.includes("Regret cases"), "human scorecard should show regret cases");
   assert(scorecardTty.stdout.includes("check or verdict"), "human scorecard should state the instrumented-decision definition from PROOF.md");
 
+  // The PROOF.md quotas are cross-repo, so --repos pools decisions from
+  // explicitly named local repos. Each repo is still scored on its own ledger.
+  const secondScorecardRoot = join(tempRoot, "routing-scorecard-second");
+  await mkdir(join(secondScorecardRoot, ".rux", "ledger"), { recursive: true });
+  await writeFile(join(secondScorecardRoot, ".rux", "ledger", "2026-06-20.jsonl"), scorecardFixture, "utf8");
+  const multiScorecard = JSON.parse(run("node", [
+    cliPath,
+    "status",
+    "--scorecard",
+    "--cwd",
+    scorecardRoot,
+    "--repos",
+    secondScorecardRoot
+  ]).stdout);
+  assert(multiScorecard.view === "routing_scorecard_multi_repo", "--repos should emit the cross-repo scorecard view");
+  assert(multiScorecard.repos.length === 2, "--repos should include the current repo plus each named repo");
+  assert(multiScorecard.adherence.decisions === 14, "cross-repo decisions should be the sum of the per-repo decisions");
+  assert(multiScorecard.adherence.followed === 8 && multiScorecard.adherence.overridden === 4, "cross-repo adherence should pool followed and overridden decisions");
+  assert(multiScorecard.divergence.test_set.size === 4, "cross-repo divergence test set should pool followed divergences");
+  assert(multiScorecard.divergence.test_set.win_rate === 0.5, "pooling identical repos should preserve the divergence win-rate");
+  assert(multiScorecard.repos.every((repo) => repo.instrumented_decisions === multiScorecard.repos[0].instrumented_decisions), "identical fixtures should score identically per repo");
+  assert(multiScorecard.breadth.repos_with_instrumented_decisions === 2, "breadth should count only repos that carry instrumented decisions");
+  assert(multiScorecard.breadth.repos_met === false, "two repos should not meet the four-repo breadth target");
+  assert(multiScorecard.concentration.top_repo_share === 0.5 && multiScorecard.concentration.concentrated === false, "an even split should not be flagged as concentrated");
+  assert(multiScorecard.divergence.parse_coverage.total === 14 && multiScorecard.divergence.parse_coverage.unclassified === 4, "parse coverage should report how much of the stamped record could be classified");
+  assert(multiScorecard.standing_zeros.find((zero) => zero.name === "lifecycle_marks").value === 2, "standing zeros should aggregate across scanned repos");
+  assert(multiScorecard.kill_check.inputs.instrumented_decisions === multiScorecard.breadth.instrumented_decisions, "the kill check should read the pooled instrumented-decision count");
+  assert(multiScorecard.notes.some((note) => note.includes("no provider calls and no ledger writes")), "the cross-repo view should state it is read-only");
+
+  const missingRepoPath = spawnSync("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot, "--repos", join(tempRoot, "no-such-repo")], { encoding: "utf8" });
+  assert(missingRepoPath.status !== 0, "--repos should fail on a path that does not exist");
+  assert(missingRepoPath.stderr.includes("--repos path does not exist"), "--repos should name the missing path");
+
+  const multiScorecardTty = spawnSync("node", [cliPath, "status", "--scorecard", "--cwd", scorecardRoot, "--repos", secondScorecardRoot], {
+    encoding: "utf8",
+    env: { ...process.env, RUX_FORCE_TTY: "1" }
+  });
+  assert(multiScorecardTty.status === 0, "forced TTY cross-repo scorecard should complete");
+  assert(multiScorecardTty.stdout.includes("By repo"), "human cross-repo scorecard should show the per-repo breakout");
+  assert(multiScorecardTty.stdout.includes("parse coverage"), "human cross-repo scorecard should state parse coverage");
+
   const scorecardLedgerAfter = await readFile(scorecardLedgerPath, "utf8");
   assert(scorecardLedgerAfter === scorecardFixture, "the scorecard path must not write to the ledger");
   assert(!existsSync(join(scorecardRoot, ".rux", "reports")), "the scorecard path must not create report files");
+  const secondLedgerAfter = await readFile(join(secondScorecardRoot, ".rux", "ledger", "2026-06-20.jsonl"), "utf8");
+  assert(secondLedgerAfter === scorecardFixture, "the cross-repo scorecard must not write to any scanned ledger");
 
   const runResult = run("node", [
     cliPath,

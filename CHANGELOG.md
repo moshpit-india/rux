@@ -2,6 +2,16 @@
 
 Notable changes to `@moshpits/rux`, newest first. Release rules live in [docs/STANDARDS.md](docs/STANDARDS.md): weekly patch train, emergency patches only for dangerous or breaking behavior, version bumps only when cutting a release.
 
+## 0.3.0 — 2026-07-21
+
+Adds the read-only proof-quarter routing scorecard — the instrument `docs/PROOF.md` allows for judging whether `suggest` changes routing decisions for the better.
+
+- `rux status --scorecard` reports adherence rate, followed-versus-overridden outcomes, the divergence test set, regret cases, standing-zero progress, and kill-criterion inputs, citing run IDs on every figure. It parses each stamped routing note as the decision-time record rather than recomputing the recommendation, and lists notes it cannot read as `unclassified` with their parse gaps.
+- `rux status --scorecard --repos PATH[,PATH...]` pools decisions from explicitly named local repos, since the pre-registered quotas are cross-repo. Each repo is scored on its own ledger, so report-to-run joins never cross repo boundaries. Adds a per-repo breakout, a concentration warning when one repo supplies most of the record, bar-target progress, and parse coverage.
+- `--since` / `--until` override the pre-registered window.
+
+Read-only throughout: no ledger writes, no provider calls, no network, no auto-discovery, and no LLM judges. The view reports kill-criterion inputs and never declares the null result itself.
+
 ## 0.2.4 — 2026-07-21
 
 Packaging and developer-experience polish. No runtime behavior changes.

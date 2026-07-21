@@ -24,6 +24,14 @@ const PROOF_QUARTER = {
   end: "2026-09-12",
   kill_checkpoint: "2026-08-01",
   kill_checkpoint_min_decisions: 20,
+  // The end-of-window bar. It is cross-repo by construction, so only the
+  // --repos view can report against it.
+  bar_targets: {
+    instrumented_decisions: 40,
+    repos: 4,
+    task_kinds: 3,
+    divergences: 10
+  },
   standing_zero_targets: {
     live_claude_task_runs_ok: 5,
     lifecycle_marks: 5,
@@ -70,6 +78,7 @@ const knownOptionNames = new Set([
   "purpose",
   "record",
   "repair-runner",
+  "repos",
   "reviewer-runner",
   "roster",
   "run-id",
@@ -210,8 +219,9 @@ Start:
       Read-only readiness check: Node, git, ledger state, provider CLIs.
   ${CLI_NAME} status [--cwd PATH] [--json]
       Ledger health, evidence maturity, release blockers, next actions.
-  ${CLI_NAME} status --scorecard [--since DATE] [--until DATE] [--cwd PATH] [--json]
+  ${CLI_NAME} status --scorecard [--repos PATH[,PATH...]] [--since DATE] [--until DATE] [--cwd PATH] [--json]
       Routing scorecard: adherence, divergence win-rate, regret cases, all citing run IDs.
+      --repos adds named local repos so the cross-repo PROOF.md bar can be read.
 
 Decide:
   ${CLI_NAME} suggest "<task>" [--in-session claude|codex|gemini] [--include-probes] [--cwd PATH] [--json]
@@ -1366,8 +1376,39 @@ async function status(args) {
 // LLM judges. It extends `status` instead of adding a top-level noun.
 async function statusScorecard(options) {
   const cwd = resolveCwd(options);
+  if (options.repos !== undefined) {
+    const sources = [];
+    for (const repoPath of parseScorecardRepoPaths(options.repos, cwd)) {
+      sources.push({ cwd: repoPath, events: await readLedger(repoPath) });
+    }
+    emitResult(options, buildMultiRepoScorecard({ sources, options }), formatMultiRepoScorecardHuman);
+    return;
+  }
   const events = await readLedger(cwd);
   emitResult(options, buildScorecard({ cwd, events, options }), formatScorecardHuman);
+}
+
+// The PROOF.md quotas are cross-repo ("at least 40 instrumented routing
+// decisions across at least 4 repos"), so judging them from one ledger is not
+// possible. --repos names local repo paths explicitly: no auto-discovery, no
+// network, no daemon, mirroring `import --from PATH`. Each repo is scored on its
+// own ledger so report-to-run joins never cross repo boundaries; only the
+// resulting decisions are pooled.
+function parseScorecardRepoPaths(value, cwd) {
+  const paths = String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => resolve(cwd, entry));
+  if (paths.length === 0) {
+    throw new Error("--repos needs at least one repo path.");
+  }
+  for (const path of paths) {
+    if (!existsSync(path)) {
+      throw new Error(`--repos path does not exist: ${path}`);
+    }
+  }
+  return unique([cwd, ...paths]);
 }
 
 function buildScorecard({ cwd, events, options = {} }) {
@@ -1390,16 +1431,18 @@ function buildScorecard({ cwd, events, options = {} }) {
     .map((report) => buildRoutingDecision({ report, runsById, childrenByParent, verdicts, marks }))
     .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
 
-  const followed = decisions.filter((decision) => decision.adherence === "followed");
-  const overridden = decisions.filter((decision) => decision.adherence === "overridden");
-  const unclearAdherence = decisions.filter((decision) => decision.adherence === "unclear");
-  const divergenceFollowed = decisions.filter((decision) => decision.decision_class === "divergence_followed");
-  const divergenceOverridden = decisions.filter((decision) => decision.decision_class === "divergence_overridden");
-  const aligned = decisions.filter((decision) => decision.decision_class.startsWith("aligned"));
-  const unclassified = decisions.filter((decision) => decision.decision_class === "unclassified");
-  const restatements = divergenceOverridden.filter((decision) => decision.restatement === true);
-  const nonRestatements = divergenceOverridden.filter((decision) => decision.restatement !== true);
-  const instrumented = decisions.filter((decision) => decision.instrumented === true);
+  const {
+    followed,
+    overridden,
+    unclearAdherence,
+    divergenceFollowed,
+    divergenceOverridden,
+    aligned,
+    unclassified,
+    restatements,
+    nonRestatements,
+    instrumented
+  } = groupDecisions(decisions);
 
   return {
     product: PRODUCT_NAME,
@@ -1473,6 +1516,24 @@ function buildScorecard({ cwd, events, options = {} }) {
       "A followed divergence is only visible when the note says a handoff was recommended; recommended and actual runner match once the handoff is taken. Unparseable notes are listed under divergence.unclassified rather than dropped.",
       "Win-rate denominators exclude unjudged runs. Only human_rejected, checks_failed, run_failed, and reverted_downstream count as losses."
     ]
+  };
+}
+
+// One classification pass, shared by the single-repo and cross-repo views so an
+// aggregate can never disagree with the repos it is made of.
+function groupDecisions(decisions) {
+  const divergenceOverridden = decisions.filter((decision) => decision.decision_class === "divergence_overridden");
+  return {
+    followed: decisions.filter((decision) => decision.adherence === "followed"),
+    overridden: decisions.filter((decision) => decision.adherence === "overridden"),
+    unclearAdherence: decisions.filter((decision) => decision.adherence === "unclear"),
+    divergenceFollowed: decisions.filter((decision) => decision.decision_class === "divergence_followed"),
+    divergenceOverridden,
+    aligned: decisions.filter((decision) => decision.decision_class.startsWith("aligned")),
+    unclassified: decisions.filter((decision) => decision.decision_class === "unclassified"),
+    restatements: divergenceOverridden.filter((decision) => decision.restatement === true),
+    nonRestatements: divergenceOverridden.filter((decision) => decision.restatement !== true),
+    instrumented: decisions.filter((decision) => decision.instrumented === true)
   };
 }
 
@@ -1815,6 +1876,236 @@ function buildStandingZeros({ topRuns, events, verdicts, marks, window }) {
   ];
 }
 
+function buildMultiRepoScorecard({ sources, options = {} }) {
+  const window = resolveScorecardWindow(options);
+  const perRepo = sources.map((source) => ({
+    cwd: source.cwd,
+    label: basename(source.cwd),
+    has_ledger: existsSync(join(source.cwd, STORE_DIR, LEDGER_DIR)),
+    scorecard: buildScorecard({ cwd: source.cwd, events: source.events, options })
+  }));
+
+  const decisions = perRepo
+    .flatMap((entry) => entry.scorecard.decisions.map((decision) => ({ ...decision, repo: entry.label })))
+    .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+  const groups = groupDecisions(decisions);
+  const repos = perRepo.map((entry) => {
+    const repoGroups = groupDecisions(entry.scorecard.decisions);
+    return {
+      repo: entry.label,
+      cwd: entry.cwd,
+      has_ledger: entry.has_ledger,
+      stamped_decisions: entry.scorecard.decisions.length,
+      instrumented_decisions: repoGroups.instrumented.length,
+      followed: repoGroups.followed.length,
+      overridden: repoGroups.overridden.length,
+      divergences: repoGroups.divergenceFollowed.length + repoGroups.divergenceOverridden.length,
+      followed_divergences: repoGroups.divergenceFollowed.length
+    };
+  });
+
+  const taskKinds = unique(perRepo.flatMap((entry) =>
+    entry.scorecard.decisions.map((decision) => decision.task_kind).filter(Boolean)));
+  const reposWithDecisions = repos.filter((repo) => repo.instrumented_decisions > 0);
+
+  return {
+    product: PRODUCT_NAME,
+    cli: CLI_NAME,
+    view: "routing_scorecard_multi_repo",
+    schema_version: SCHEMA_VERSION,
+    generated_at: new Date().toISOString(),
+    cwd: sources[0]?.cwd ?? null,
+    window,
+    bar: perRepo[0]?.scorecard.bar ?? null,
+    repos,
+    breadth: buildScorecardBreadth({ repos, reposWithDecisions, groups, taskKinds }),
+    concentration: buildScorecardConcentration({ repos, total: groups.instrumented.length }),
+    adherence: {
+      decisions: decisions.length,
+      followed: groups.followed.length,
+      overridden: groups.overridden.length,
+      unclear: groups.unclearAdherence.length,
+      adherence_rate: rateOrNull(groups.followed.length, groups.followed.length + groups.overridden.length),
+      followed_run_ids: citedRunIds(groups.followed),
+      overridden_run_ids: citedRunIds(groups.overridden)
+    },
+    outcomes_by_adherence: {
+      followed: summarizeDecisionOutcomes(groups.followed),
+      overridden: summarizeDecisionOutcomes(groups.overridden)
+    },
+    divergence: {
+      test_set: summarizeDecisionOutcomes(groups.divergenceFollowed),
+      overridden: {
+        ...summarizeDecisionOutcomes(groups.divergenceOverridden),
+        restatements: groups.restatements.length,
+        restatement_run_ids: citedRunIds(groups.restatements),
+        non_restatements: groups.nonRestatements.length,
+        non_restatement_outcomes: summarizeDecisionOutcomes(groups.nonRestatements)
+      },
+      aligned: summarizeDecisionOutcomes(groups.aligned),
+      unclassified: groups.unclassified.map((decision) => ({
+        repo: decision.repo,
+        report_id: decision.report_id,
+        run_id: decision.run_id,
+        parse_gaps: decision.parse_gaps
+      })),
+      advantage: divergenceAdvantage(groups.divergenceFollowed, groups.nonRestatements),
+      assessment: divergenceAssessment(groups.divergenceFollowed, groups.divergenceOverridden, groups.restatements),
+      parse_coverage: buildParseCoverage(decisions, groups.unclassified)
+    },
+    regret: perRepo.flatMap((entry) =>
+      entry.scorecard.regret.map((item) => ({ ...item, repo: entry.label }))),
+    standing_zeros: aggregateStandingZeros(perRepo),
+    kill_check: buildMultiRepoKillCheck({ groups, window }),
+    decisions,
+    notes: [
+      "status --scorecard --repos is read-only: no provider calls and no ledger writes.",
+      "Repo paths are explicit. Rux does not auto-discover repos, sync, or read anything over a network.",
+      "Each repo is scored on its own ledger; only the resulting decisions are pooled, so report-to-run joins never cross repo boundaries.",
+      "PROOF.md wants breadth, not just volume: check the per-repo table before trusting an aggregate win-rate.",
+      "Win-rate denominators exclude unjudged runs. Only human_rejected, checks_failed, run_failed, and reverted_downstream count as losses."
+    ]
+  };
+}
+
+// Divergence is only visible when a stamped note names both the recommendation
+// and the in-session runner. Notes that predate that habit parse as
+// unclassified, so the divergence figures describe only the classified share.
+// Report that share rather than letting a percentage imply full coverage.
+function buildParseCoverage(decisions, unclassified) {
+  const classified = decisions.length - unclassified.length;
+  const rate = rateOrNull(classified, decisions.length);
+  const underHalf = rate !== null && rate < 0.5;
+  return {
+    classified,
+    unclassified: unclassified.length,
+    total: decisions.length,
+    rate,
+    warning: underHalf
+      ? `Only ${formatPercent(rate)} of stamped decisions could be classified (${classified}/${decisions.length}); the divergence figures describe that subset, not all recorded decisions. Stamp notes with both the recommendation and --in-session runner to raise coverage.`
+      : null
+  };
+}
+
+function buildScorecardBreadth({ repos, reposWithDecisions, groups, taskKinds }) {
+  const targets = PROOF_QUARTER.bar_targets ?? {};
+  const minDecisions = targets.instrumented_decisions ?? 40;
+  const minRepos = targets.repos ?? 4;
+  const minKinds = targets.task_kinds ?? 3;
+  return {
+    instrumented_decisions: groups.instrumented.length,
+    instrumented_decisions_target: minDecisions,
+    instrumented_decisions_met: groups.instrumented.length >= minDecisions,
+    repos_with_instrumented_decisions: reposWithDecisions.length,
+    repos_target: minRepos,
+    repos_met: reposWithDecisions.length >= minRepos,
+    repos_scanned: repos.length,
+    task_kinds: taskKinds,
+    task_kinds_target: minKinds,
+    task_kinds_met: taskKinds.length >= minKinds,
+    divergences: groups.divergenceFollowed.length + groups.divergenceOverridden.length,
+    divergences_target: targets.divergences ?? 10,
+    divergences_met: (groups.divergenceFollowed.length + groups.divergenceOverridden.length) >= (targets.divergences ?? 10)
+  };
+}
+
+// Volume can clear the bar while breadth quietly fails: one busy repo can supply
+// most of the decisions, and a finding drawn mostly from one codebase's task
+// shapes may not generalize. Surface the share instead of burying it in a total.
+function buildScorecardConcentration({ repos, total }) {
+  const ranked = [...repos]
+    .filter((repo) => repo.instrumented_decisions > 0)
+    .sort((left, right) => right.instrumented_decisions - left.instrumented_decisions);
+  const top = ranked[0] ?? null;
+  const share = top ? rateOrNull(top.instrumented_decisions, total) : null;
+  const concentrated = share !== null && share > 0.5;
+  return {
+    top_repo: top?.repo ?? null,
+    top_repo_instrumented_decisions: top?.instrumented_decisions ?? 0,
+    top_repo_share: share,
+    concentrated,
+    warning: concentrated
+      ? `${top.repo} supplies ${formatPercent(share)} of instrumented decisions. The count may clear the bar while the finding still rests on one repo's task shapes — read the per-repo table before generalizing.`
+      : null
+  };
+}
+
+function aggregateStandingZeros(perRepo) {
+  const targets = PROOF_QUARTER.standing_zero_targets;
+  const pick = (name) => perRepo.map((entry) => entry.scorecard.standing_zeros.find((zero) => zero.name === name)).filter(Boolean);
+  const sumCount = (name) => pick(name).reduce((total, zero) => total + (zero.value ?? 0), 0);
+  const runIds = (name) => pick(name).flatMap((zero) => zero.run_ids ?? []);
+  const sumDetail = (name, field) => pick(name).reduce((total, zero) => total + (zero.detail?.[field] ?? 0), 0);
+
+  const claudeOk = sumCount("live_claude_task_runs_ok");
+  const markCount = sumCount("lifecycle_marks");
+  const observed = sumDetail("observed_model_metadata_share", "observed");
+  const observedTotal = sumDetail("observed_model_metadata_share", "new_live_runs");
+  const withVerdict = sumDetail("new_run_verdict_coverage", "with_verdict");
+  const verdictTotal = sumDetail("new_run_verdict_coverage", "new_live_runs");
+  const observedShare = rateOrNull(observed, observedTotal);
+  const verdictShare = rateOrNull(withVerdict, verdictTotal);
+
+  return [
+    {
+      name: "live_claude_task_runs_ok",
+      target: `>= ${targets.live_claude_task_runs_ok} completed live Claude task runs`,
+      value: claudeOk,
+      met: claudeOk >= targets.live_claude_task_runs_ok,
+      run_ids: runIds("live_claude_task_runs_ok")
+    },
+    {
+      name: "lifecycle_marks",
+      target: `>= ${targets.lifecycle_marks} real lifecycle marks`,
+      value: markCount,
+      met: markCount >= targets.lifecycle_marks,
+      run_ids: runIds("lifecycle_marks")
+    },
+    {
+      name: "observed_model_metadata_share",
+      target: "provider-observed model metadata on the majority of new live runs",
+      value: observedShare,
+      detail: { observed, new_live_runs: observedTotal },
+      met: observedShare !== null && observedShare > targets.observed_model_share,
+      run_ids: runIds("observed_model_metadata_share")
+    },
+    {
+      name: "new_run_verdict_coverage",
+      target: ">= 60% verdict coverage on new live runs",
+      value: verdictShare,
+      detail: { with_verdict: withVerdict, new_live_runs: verdictTotal },
+      met: verdictShare !== null && verdictShare >= targets.new_run_verdict_coverage,
+      run_ids: runIds("new_run_verdict_coverage")
+    }
+  ];
+}
+
+function buildMultiRepoKillCheck({ groups, window }) {
+  const instrumented = groups.instrumented.length;
+  const enoughDecisions = instrumented >= PROOF_QUARTER.kill_checkpoint_min_decisions;
+  const followedDivergences = groups.divergenceFollowed.length;
+  return {
+    checkpoint: PROOF_QUARTER.kill_checkpoint,
+    source: PROOF_QUARTER.source,
+    inputs: {
+      instrumented_decisions: instrumented,
+      min_decisions_required: PROOF_QUARTER.kill_checkpoint_min_decisions,
+      minimum_met: enoughDecisions,
+      divergences_recorded: followedDivergences + groups.divergenceOverridden.length,
+      followed_divergences: followedDivergences,
+      overridden_divergences: groups.divergenceOverridden.length,
+      restatement_overrides: groups.restatements.length
+    },
+    ready_to_judge: enoughDecisions && followedDivergences > 0,
+    guidance: !enoughDecisions
+      ? `Fewer than ${PROOF_QUARTER.kill_checkpoint_min_decisions} instrumented decisions across the scanned repos in ${window.start}..${window.end}. Add repos with --repos or keep capturing.`
+      : followedDivergences === 0
+        ? `The ${PROOF_QUARTER.kill_checkpoint_min_decisions}-decision minimum is met (${instrumented}), but no followed divergence exists: suggest has never been taken when it named a different runner. Criterion (b) cannot be evaluated on win-rate; criterion (a) is the live question.`
+        : "Both kill-criterion inputs are present across the scanned repos; a human reads the itemized decisions and decides.",
+    note: "This view reports the kill-criterion inputs. It never declares the null result — that is a human call recorded in docs/STATE.md."
+  };
+}
+
 function resolveScorecardWindow(options) {
   const since = scorecardWindowOption(options.since, "--since", PROOF_QUARTER.start, false);
   const until = scorecardWindowOption(options.until, "--until", PROOF_QUARTER.end, true);
@@ -1912,6 +2203,68 @@ function formatScorecardHuman(scorecard) {
   }
 
   lines.push("", `Kill checkpoint ${scorecard.kill_check.checkpoint}: ${scorecard.kill_check.ready_to_judge ? "inputs present" : "not judgeable from this repo alone"}`);
+  lines.push(`- ${scorecard.kill_check.guidance}`);
+
+  lines.push("", "Notes");
+  lines.push(...scorecard.notes.map((note) => `- ${note}`));
+  return lines.join("\n");
+}
+
+function formatMultiRepoScorecardHuman(scorecard) {
+  const divergence = scorecard.divergence;
+  const breadth = scorecard.breadth;
+  const lines = [
+    `${PRODUCT_NAME} routing scorecard (${scorecard.repos.length} repos)`,
+    `Window: ${scorecard.window.start} .. ${scorecard.window.end} (${scorecard.window.source})`,
+    `Decisions: ${scorecard.adherence.decisions} stamped, ${breadth.instrumented_decisions} instrumented (report + linked run + check or verdict)`,
+    `Adherence: ${formatPercent(scorecard.adherence.adherence_rate)} (${scorecard.adherence.followed} followed / ${scorecard.adherence.overridden} overridden / ${scorecard.adherence.unclear} unclear)`
+  ];
+
+  lines.push("", "By repo");
+  lines.push("  repo                  instrumented  stamped  followed  overridden  divergences");
+  for (const repo of [...scorecard.repos].sort((left, right) => right.instrumented_decisions - left.instrumented_decisions)) {
+    lines.push(
+      `  ${repo.repo.padEnd(20).slice(0, 20)}  ${String(repo.instrumented_decisions).padStart(12)}  ${String(repo.stamped_decisions).padStart(7)}  ${String(repo.followed).padStart(8)}  ${String(repo.overridden).padStart(10)}  ${String(repo.divergences).padStart(11)}`
+      + (repo.has_ledger ? "" : "   (no ledger)")
+    );
+  }
+  if (scorecard.concentration.warning) {
+    lines.push(`  ! ${scorecard.concentration.warning}`);
+  }
+
+  lines.push("", `Pre-registered bar (${scorecard.bar?.source ?? PROOF_QUARTER.source})`);
+  lines.push(`- instrumented decisions: ${breadth.instrumented_decisions} / ${breadth.instrumented_decisions_target} — ${breadth.instrumented_decisions_met ? "met" : "not met"}`);
+  lines.push(`- repos with decisions: ${breadth.repos_with_instrumented_decisions} / ${breadth.repos_target} — ${breadth.repos_met ? "met" : "not met"}`);
+  lines.push(`- task kinds: ${breadth.task_kinds.length} / ${breadth.task_kinds_target} — ${breadth.task_kinds_met ? "met" : "not met"}${breadth.task_kinds.length > 0 ? ` (${breadth.task_kinds.join(", ")})` : ""}`);
+  lines.push(`- divergences: ${breadth.divergences} / ${breadth.divergences_target} — ${breadth.divergences_met ? "met" : "not met"}`);
+
+  lines.push("", "Divergence test set (suggest recommended a different runner than the in-session one)");
+  lines.push(`- followed divergences: n=${divergence.test_set.size}, win-rate ${formatPercent(divergence.test_set.win_rate)} (${divergence.test_set.wins}W/${divergence.test_set.losses}L, ${divergence.test_set.unjudged} unjudged)`);
+  lines.push(`- overridden divergences: n=${divergence.overridden.size}, of which ${divergence.overridden.restatements} plain continue-in-session restatement(s) excluded from the signal`);
+  lines.push(`- non-restatement overrides: n=${divergence.overridden.non_restatements}, win-rate ${formatPercent(divergence.overridden.non_restatement_outcomes.win_rate)}`);
+  lines.push(`- aligned decisions: n=${divergence.aligned.size}, win-rate ${formatPercent(divergence.aligned.win_rate)}`);
+  lines.push(`- parse coverage: ${divergence.parse_coverage.classified}/${divergence.parse_coverage.total} decisions classified (${formatPercent(divergence.parse_coverage.rate)}), ${divergence.parse_coverage.unclassified} unclassified`);
+  if (divergence.parse_coverage.warning) {
+    lines.push(`  ! ${divergence.parse_coverage.warning}`);
+  }
+  lines.push(`- assessment: ${divergence.assessment}`);
+
+  if (scorecard.regret.length > 0) {
+    lines.push("", "Regret cases");
+    lines.push(...scorecard.regret.map((item) => `- [${item.repo}] ${item.run_id}: ${item.decision_class} (${item.adherence}), outcome ${item.outcome} — ${item.summary}`));
+  } else {
+    lines.push("", "Regret cases: none in this window.");
+  }
+
+  lines.push("", "Standing zeros (all scanned repos)");
+  for (const zero of scorecard.standing_zeros) {
+    const value = zero.detail
+      ? `${formatPercent(zero.value)} (${zero.detail.observed ?? zero.detail.with_verdict}/${zero.detail.new_live_runs})`
+      : String(zero.value);
+    lines.push(`- ${zero.name}: ${value} — target ${zero.target} — ${zero.met ? "met" : "not met"}`);
+  }
+
+  lines.push("", `Kill checkpoint ${scorecard.kill_check.checkpoint}: ${scorecard.kill_check.ready_to_judge ? "inputs present" : "inputs incomplete"}`);
   lines.push(`- ${scorecard.kill_check.guidance}`);
 
   lines.push("", "Notes");
